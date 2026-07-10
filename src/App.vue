@@ -1,0 +1,741 @@
+<template>
+  <div class="app">
+    <!-- Ribbon 工具栏（含品牌 + 标签页） -->
+    <Toolbar />
+
+    <!-- 主体 -->
+    <div class="main-body">
+      <!-- 左侧页面面板 -->
+      <PagePanel />
+
+      <!-- 中间编辑区 -->
+      <div ref="editorAreaRef" class="editor-area">
+        <!-- 全文搜索浮层 -->
+        <SearchBar />
+
+        <!-- 加载遮罩 -->
+        <div v-if="store.isLoading" class="loading-mask">
+          <div class="loading-panel">
+            <p class="loading-text">{{ store.loadingText }}</p>
+            <el-progress
+                :percentage="store.loadingProgress ?? 0"
+                :stroke-width="12"
+                striped
+                striped-flow
+                :duration="12"
+                class="loading-bar"
+            />
+            <span class="loading-percent">{{ store.loadingProgress ?? 0 }}%</span>
+          </div>
+        </div>
+
+        <!-- 编辑器 -->
+        <template v-if="store.document">
+          <ContinuousPageView
+              v-if="store.pageViewMode === 'continuous'"
+              ref="continuousViewRef"
+          />
+          <div
+              v-else-if="store.currentPage"
+              class="canvas-container"
+              :style="singleCanvasFrameStyle"
+          >
+            <CanvasEditor
+                ref="singleCanvasRef"
+                :page="store.currentPage"
+                :page-index="store.currentPageIndex"
+            />
+          </div>
+        </template>
+
+        <!-- 欢迎页 -->
+        <div v-else class="welcome">
+          <div class="welcome-card">
+            <div class="welcome-logo">OFD</div>
+            <h1 class="welcome-title">OFD Studio</h1>
+            <p class="welcome-desc">专业的开放版式文档（OFD）编辑器<br/>解析 · 编辑 · 批注 · 与 PDF 双向转换</p>
+
+            <div class="welcome-actions">
+              <el-button type="primary" size="large" :icon="Upload" @click="triggerUpload">
+                打开 OFD 文件
+              </el-button>
+              <el-button size="large" :icon="Upload" @click="triggerPdf">
+                导入 PDF
+              </el-button>
+            </div>
+
+            <div class="welcome-feats">
+              <div class="feat"><span class="feat-dot"></span>非破坏性编辑</div>
+              <div class="feat"><span class="feat-dot"></span>十类注释批注</div>
+              <div class="feat"><span class="feat-dot"></span>像素级保真转换</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右侧：属性 / 注释列表 -->
+      <RightSidePanel />
+    </div>
+
+    <!-- 底部状态栏 -->
+    <footer class="status-bar">
+      <div class="status-left">
+        <template v-if="store.document">
+          <span>{{ store.document.title }}</span>
+          <span class="status-sep">|</span>
+          <span>第 {{ store.currentPageIndex + 1 }} / {{ store.document.pageCount }} 页</span>
+          <span class="status-sep">|</span>
+          <span>缩放 {{ Math.round(store.scale * 100) }}%</span>
+          <template v-if="store.viewRotation !== 0">
+            <span class="status-sep">|</span>
+            <span>视图旋转 {{ normalizeViewRotation(store.viewRotation) }}°</span>
+          </template>
+          <template v-if="store.currentPage?.pageRotate">
+            <span class="status-sep">|</span>
+            <span>页旋转 {{ normalizeViewRotation(store.currentPage.pageRotate) }}°</span>
+          </template>
+          <template v-if="store.watermarkConfig">
+            <span class="status-sep">|</span>
+            <span>水印：{{ store.watermarkConfig.text }}</span>
+          </template>
+        </template>
+        <span v-else>就绪</span>
+      </div>
+      <span class="version">OFD Studio v1.0</span>
+    </footer>
+
+    <!-- 打印对话框 -->
+    <PrintDialog @print="handlePrint" />
+
+    <!-- 快捷键说明 -->
+    <ShortcutsDialog v-model="store.shortcutsDialogVisible" />
+
+    <!-- 隐藏的文件输入 -->
+    <input ref="uploadRef" type="file" accept=".ofd"
+           style="display:none" @change="handleWelcomeUpload" />
+    <input ref="pdfRef" type="file" accept=".pdf"
+           style="display:none" @change="handleWelcomePdf" />
+
+    <!-- 离屏画布：仅供左侧缩略图截图，不切换主编辑区当前页 -->
+    <div
+        v-if="store.document && thumbCapturePage"
+        class="thumb-capture-host"
+        aria-hidden="true"
+    >
+      <CanvasEditor
+          :key="`thumb-${thumbCapturePageIndex}`"
+          ref="thumbCanvasRef"
+          offscreen
+          :fixed-scale="1"
+          :page="thumbCapturePage"
+          :page-index="thumbCapturePageIndex"
+      />
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { Upload } from '@element-plus/icons-vue'
+import { useEditorStore } from '@/stores/editorStore'
+import { saveDocument, openPrintDialog } from '@/composables/useDocumentFileActions'
+import { registerBeforeUnloadGuard } from '@/composables/useUnsavedChangesGuard'
+import { openOfdDocument, openPdfDocument } from '@/composables/useDocumentOpen'
+import {
+  buildPagePngFilename, dataUrlToBlob, downloadPngZip,
+  EXPORT_PAGE_PIXEL_RATIO, resolveExportPageIndices, type ExportPagesOptions,
+} from '@/utils/exportPageImage'
+import Toolbar from '@/components/Toolbar.vue'
+import PagePanel from '@/components/PagePanel.vue'
+import CanvasEditor from '@/components/CanvasEditor.vue'
+import ContinuousPageView from '@/components/ContinuousPageView.vue'
+import RightSidePanel from '@/components/RightSidePanel.vue'
+import PrintDialog from '@/components/PrintDialog.vue'
+import ShortcutsDialog from '@/components/ShortcutsDialog.vue'
+import SearchBar from '@/components/SearchBar.vue'
+import {
+  buildPrintWindow, resolvePageIndices, qualityToPixelRatio,
+  type PrintOptions, type CapturedPage,
+} from '@/utils/print'
+import { normalizeViewRotation, viewStagePixelSize } from '@/utils/viewRotation'
+
+const store = useEditorStore()
+const uploadRef = ref<HTMLInputElement>()
+const pdfRef = ref<HTMLInputElement>()
+const singleCanvasRef = ref<InstanceType<typeof CanvasEditor> | null>(null)
+const continuousViewRef = ref<InstanceType<typeof ContinuousPageView> | null>(null)
+
+function getActiveCanvas() {
+  if (store.pageViewMode === 'continuous') {
+    return continuousViewRef.value?.getCanvasForPage(store.currentPageIndex) ?? null
+  }
+  return singleCanvasRef.value
+}
+const thumbCanvasRef = ref<InstanceType<typeof CanvasEditor> | null>(null)
+const editorAreaRef = ref<HTMLElement>()
+const thumbCapturePageIndex = ref(0)
+const thumbCapturePage = computed(() =>
+    store.document?.pages[thumbCapturePageIndex.value] ?? null,
+)
+
+const singleCanvasFrameStyle = computed(() => {
+  const page = store.currentPage
+  if (!page) return {}
+  const { stageWidth, stageHeight } = viewStagePixelSize(
+      page.width,
+      page.height,
+      store.scale,
+      normalizeViewRotation((page.pageRotate ?? 0) + store.viewRotation),
+  )
+  return {
+    width: `${stageWidth}px`,
+    height: `${stageHeight}px`,
+  }
+})
+
+/** 左侧缩略图：按需截取单页（低分辨率） */
+const THUMBNAIL_PIXEL_RATIO = 0.22
+
+async function waitForCanvasPaint() {
+  await nextTick()
+  await new Promise<void>((r) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => r()))
+  })
+}
+
+/** 离屏缩略图：等待对应页画布挂载并完成布局（合并后页数多、资源大时需更长时间） */
+async function waitForThumbCanvasReady(pageIndex: number, maxMs = 10_000) {
+  const start = Date.now()
+  while (Date.now() - start < maxMs) {
+    await nextTick()
+    const page = store.document?.pages[pageIndex]
+    if (thumbCanvasRef.value && thumbCapturePageIndex.value === pageIndex && page) {
+      await new Promise<void>((r) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => r()))
+      })
+      return true
+    }
+    await new Promise<void>((r) => setTimeout(r, 50))
+  }
+  return false
+}
+
+async function handleExportPagesImage(opts: ExportPagesOptions) {
+  const doc = store.document
+  if (!doc) return
+
+  const indices = resolveExportPageIndices(opts, doc.pageCount, store.currentPageIndex)
+  if (indices.length === 0) {
+    ElMessage.warning('没有可导出的页面')
+    return
+  }
+
+  const savedScale = store.scale
+  const savedPage = store.currentPageIndex
+  store.selectElement(null)
+  store.selectAnnotation(null)
+  store.setScale(1)
+  store.setLoading(true, `正在导出 0 / ${indices.length} 页…`)
+
+  const files: { name: string; blob: Blob }[] = []
+  try {
+    for (let i = 0; i < indices.length; i++) {
+      const idx = indices[i]
+      store.setLoading(true, `正在导出第 ${i + 1} / ${indices.length} 页…`)
+      store.setCurrentPage(idx)
+
+      if (store.pageViewMode === 'continuous') {
+        continuousViewRef.value?.ensurePageMounted(idx)
+      }
+      await waitForCanvasPaint()
+
+      const canvas = getActiveCanvas()
+      if (!canvas) {
+        console.warn('[export] 第', idx + 1, '页画布未就绪，已跳过')
+        continue
+      }
+
+      const cap = await canvas.captureForPrint(EXPORT_PAGE_PIXEL_RATIO, opts.includeAnnotations)
+      if (cap?.dataUrl) {
+        const blob = await dataUrlToBlob(cap.dataUrl)
+        files.push({ name: buildPagePngFilename(doc.title, idx), blob })
+      }
+    }
+  } catch (err: any) {
+    console.error('[export] 批量导出失败', err)
+    ElMessage.error(err?.message ?? '导出失败')
+    return
+  } finally {
+    store.setScale(savedScale)
+    store.setCurrentPage(savedPage)
+    store.setLoading(false)
+  }
+
+  if (files.length === 0) {
+    ElMessage.warning('导出失败（画布未就绪或存在跨域图片）')
+    return
+  }
+
+  await downloadPngZip(doc.title, files)
+  ElMessage.success(`已导出 ${files.length} 页 PNG${files.length > 1 ? '（ZIP）' : ''}`)
+}
+
+async function handleExportCurrentPageImage() {
+  await handleExportPagesImage({
+    range: 'current',
+    customRange: '',
+    includeAnnotations: true,
+  })
+}
+
+onMounted(() => {
+  store.registerEditorAreaResolver(() => editorAreaRef.value ?? null)
+  store.registerExportCurrentPageImageHook(handleExportCurrentPageImage)
+  store.registerExportPagesImageHook(handleExportPagesImage)
+  window.addEventListener('keydown', handleGlobalKeydown)
+  const removeBeforeUnload = registerBeforeUnloadGuard()
+
+  store.registerThumbnailCaptureHook(async (pageIndex: number) => {
+    const doc = store.document
+    if (!doc || pageIndex < 0 || pageIndex >= doc.pageCount) return null
+    if (!doc.pages[pageIndex]) return null
+
+    thumbCapturePageIndex.value = pageIndex
+    const ready = await waitForThumbCanvasReady(pageIndex)
+    if (!ready || !thumbCanvasRef.value) {
+      console.warn('[thumbnail] 离屏画布未就绪', pageIndex)
+      return null
+    }
+
+    const cap = await thumbCanvasRef.value.captureForPrint(THUMBNAIL_PIXEL_RATIO, true)
+    const url = cap?.dataUrl ?? ''
+    // 过短的 dataURL 多为导出失败（空白图）
+    return url.length > 200 ? url : null
+  })
+
+  onUnmounted(() => {
+    removeBeforeUnload()
+    store.registerExportCurrentPageImageHook(null)
+    store.registerExportPagesImageHook(null)
+    store.registerThumbnailCaptureHook(null)
+    window.removeEventListener('keydown', handleGlobalKeydown)
+  })
+})
+
+function triggerUpload() {
+  uploadRef.value?.click()
+}
+function triggerPdf() {
+  pdfRef.value?.click()
+}
+
+function isEditableTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false
+  const tag = el.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+  if (el.isContentEditable) return true
+  return !!el.closest('.el-input, .el-textarea, [contenteditable="true"]')
+}
+
+function handleEscapeKey() {
+  if (store.exportPdfDialogVisible) {
+    store.exportPdfDialogVisible = false
+    return
+  }
+  if (store.shortcutsDialogVisible) {
+    store.shortcutsDialogVisible = false
+    return
+  }
+  if (store.printDialogVisible) {
+    store.printDialogVisible = false
+    return
+  }
+  if (store.searchVisible) {
+    store.closeSearch()
+    return
+  }
+  if (store.selectedAnnotationId) {
+    store.selectAnnotation(null)
+    return
+  }
+  if (store.selectedElementId) {
+    store.selectElement(null)
+    return
+  }
+  if (store.currentTool !== 'SELECT') {
+    store.setTool('SELECT')
+  }
+}
+
+function goToRelativePage(delta: number) {
+  const count = store.document?.pageCount ?? 0
+  if (count <= 0) return
+  const next = Math.max(0, Math.min(count - 1, store.currentPageIndex + delta))
+  if (next !== store.currentPageIndex) {
+    store.setCurrentPage(next, { scrollIntoView: true })
+  }
+}
+
+function handleGlobalKeydown(e: KeyboardEvent) {
+  if (isEditableTarget(e.target)) return
+
+  const mod = e.ctrlKey || e.metaKey
+
+  if (e.key === 'F1') {
+    e.preventDefault()
+    store.openShortcutsDialog()
+    return
+  }
+  if (e.key === '?' && !mod && !e.altKey) {
+    e.preventDefault()
+    store.openShortcutsDialog()
+    return
+  }
+
+  // Ctrl/Cmd + O：打开 OFD（欢迎页与编辑中均可用）
+  if (mod && (e.key === 'o' || e.key === 'O')) {
+    e.preventDefault()
+    triggerUpload()
+    return
+  }
+
+  if (e.key === 'Escape') {
+    handleEscapeKey()
+    return
+  }
+
+  if (!store.document) return
+
+  // Delete / Backspace：删除选中注释或页面元素
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (store.selectedAnnotationId) {
+      e.preventDefault()
+      void store.deleteAnnotation(store.selectedAnnotationId).then((ok) => {
+        if (ok) ElMessage.success('注释已删除')
+      })
+      return
+    }
+    if (store.canDeleteSelectedElement) {
+      e.preventDefault()
+      if (store.deleteSelectedElement()) {
+        ElMessage.success('元素已删除，保存后生效')
+      }
+    }
+    return
+  }
+
+  // PageUp / PageDown：上一页 / 下一页
+  if (!mod && e.key === 'PageUp') {
+    e.preventDefault()
+    goToRelativePage(-1)
+    return
+  }
+  if (!mod && e.key === 'PageDown') {
+    e.preventDefault()
+    goToRelativePage(1)
+    return
+  }
+
+  if (!mod) return
+
+  // Ctrl/Cmd + S：保存 OFD
+  if (e.key === 's' || e.key === 'S') {
+    e.preventDefault()
+    void saveDocument()
+    return
+  }
+
+  // Ctrl/Cmd + P：打印
+  if (e.key === 'p' || e.key === 'P') {
+    e.preventDefault()
+    openPrintDialog()
+    return
+  }
+
+  // Ctrl/Cmd + F：打开全文搜索
+  if (e.key === 'f' || e.key === 'F') {
+    e.preventDefault()
+    store.openSearch()
+    return
+  }
+
+  // Ctrl/Cmd + = / +：放大；Ctrl/Cmd + -：缩小；Ctrl/Cmd + 0：实际大小
+  if (e.key === '=' || e.key === '+') {
+    e.preventDefault()
+    store.setScale(store.scale + 0.25)
+    return
+  }
+  if (e.key === '-' || e.key === '_') {
+    e.preventDefault()
+    store.setScale(store.scale - 0.25)
+    return
+  }
+  if (e.key === '0') {
+    e.preventDefault()
+    store.setScale(1)
+    return
+  }
+
+  if (e.key === 'z' || e.key === 'Z') {
+    if (e.shiftKey) {
+      if (store.canRedo) {
+        e.preventDefault()
+        void store.redo()
+      }
+    } else if (store.canUndo) {
+      e.preventDefault()
+      void store.undo()
+    }
+    return
+  }
+
+  if (e.key === 'y' || e.key === 'Y') {
+    if (store.canRedo) {
+      e.preventDefault()
+      void store.redo()
+    }
+  }
+}
+
+async function handleWelcomeUpload(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0]
+  if (!file) return
+  await openOfdDocument(file)
+  ;(e.target as HTMLInputElement).value = ''
+}
+
+async function handlePrint(opts: PrintOptions) {
+  const doc = store.document
+  if (!doc) return
+
+  const indices = resolvePageIndices(opts, doc.pageCount, store.currentPageIndex)
+  if (indices.length === 0) {
+    ElMessage.warning('没有可打印的页面')
+    return
+  }
+
+  // 1) 先在用户手势内打开打印窗口，避免被浏览器拦截
+  const win = window.open('', '_blank', 'width=920,height=1200')
+  if (!win) {
+    ElMessage.error('打印窗口被浏览器拦截，请允许本站弹出窗口后重试')
+    return
+  }
+  win.document.write(
+    '<!doctype html><meta charset="utf-8"><title>正在准备打印…</title>' +
+    '<body style="font-family:sans-serif;color:#666;padding:48px;background:#f4f5f7">' +
+    '正在渲染页面，请稍候…</body>',
+  )
+
+  const pixelRatio = qualityToPixelRatio(opts.quality)
+
+  // 2) 保存当前视图状态，逐页渲染捕获
+  const savedScale = store.scale
+  const savedPage = store.currentPageIndex
+  store.selectElement(null)
+  store.selectAnnotation(null)
+  store.setScale(1)
+  store.setLoading(true, '正在准备打印…')
+
+  const captured: CapturedPage[] = []
+  try {
+    for (let i = 0; i < indices.length; i++) {
+      const idx = indices[i]
+      store.setLoading(true, `正在渲染第 ${i + 1} / ${indices.length} 页…`)
+      store.setCurrentPage(idx)
+
+      if (store.pageViewMode === 'continuous') {
+        continuousViewRef.value?.ensurePageMounted(idx)
+      }
+      await waitForCanvasPaint()
+
+      const canvas = getActiveCanvas()
+      if (!canvas) {
+        console.warn('[print] 第', idx + 1, '页画布未就绪，已跳过')
+        continue
+      }
+
+      const cap = await canvas.captureForPrint(pixelRatio, opts.includeAnnotations)
+      if (cap?.dataUrl) {
+        captured.push({ index: idx, ...cap })
+      }
+    }
+  } catch (err: any) {
+    console.error('[print] 渲染失败', err)
+    ElMessage.error('打印渲染失败：' + (err?.message ?? '未知错误'))
+  } finally {
+    store.setScale(savedScale)
+    store.setCurrentPage(savedPage)
+    store.setLoading(false)
+  }
+
+  // 3) 写入打印窗口并触发打印
+  if (captured.length === 0) {
+    win.close()
+    ElMessage.warning('没有可打印的页面（画布未就绪或存在跨域图片）')
+    return
+  }
+  buildPrintWindow(win, captured, opts, doc.title || 'OFD 文档')
+  ElMessage.success(`已生成 ${captured.length} 页打印预览`)
+}
+
+async function handleWelcomePdf(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0]
+  if (!file) return
+  await openPdfDocument(file)
+  ;(e.target as HTMLInputElement).value = ''
+}
+</script>
+
+<style scoped>
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--work-bg);
+}
+
+.main-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.editor-area {
+  flex: 1;
+  overflow: auto;
+  background: var(--work-bg);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 24px;
+  position: relative;
+}
+
+.canvas-container {
+  display: inline-block;
+  box-shadow: var(--shadow-page);
+  background: #fff;
+}
+
+/* 欢迎页 */
+.welcome {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #ececec;
+}
+.welcome-card {
+  text-align: center;
+  padding: 40px 48px;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: var(--shadow-md);
+  max-width: 480px;
+}
+.welcome-logo {
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 18px;
+  border-radius: 12px;
+  background: linear-gradient(145deg, var(--ribbon-accent), var(--ribbon-accent-dark));
+  color: #fff;
+  font-size: 18px;
+  font-weight: 800;
+}
+.welcome-title {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-1);
+  margin: 0 0 8px;
+}
+.welcome-desc {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-3);
+  margin: 0 0 24px;
+}
+.welcome-actions { display: flex; gap: 10px; justify-content: center; margin-bottom: 20px; }
+.welcome-feats {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.feat { display: flex; align-items: center; gap: 6px; }
+.feat-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--ribbon-accent);
+}
+
+.loading-mask {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, .78);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.loading-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  min-width: 320px;
+  max-width: 420px;
+  padding: 28px 32px;
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, .12);
+}
+.loading-text {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-1);
+  text-align: center;
+  line-height: 1.5;
+}
+.loading-bar {
+  width: 100%;
+}
+.loading-percent {
+  font-size: 12px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.status-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 24px;
+  padding: 0 12px;
+  background: var(--chrome-bg);
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.status-left { display: flex; align-items: center; gap: 8px; }
+
+/* 缩略图离屏渲染：移出视口但保持可绘制（visibility:hidden 会导致 Konva toDataURL 空白） */
+.thumb-capture-host {
+  position: fixed;
+  left: -12000px;
+  top: 0;
+  overflow: hidden;
+  opacity: 0.01;
+  pointer-events: none;
+  z-index: -1;
+}
+.status-sep { color: #ccc; }
+.version { color: #aaa; }
+</style>
