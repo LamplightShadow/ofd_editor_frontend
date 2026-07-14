@@ -1,5 +1,7 @@
 /** 矢量 Path 形状构建与 SVG path 变换（单位：mm） */
 
+import { scaleLocalPathViaModel, translateSvgPathViaModel } from '@/utils/pathModel'
+
 export interface PathShapeResult {
   x: number
   y: number
@@ -110,93 +112,12 @@ export function buildPolylineShape(points: PointMm[], closed: boolean): PathShap
   }
 }
 
-/** 页坐标 SVG path 整体平移（用于旧版解析结果拖拽） */
+/** 页坐标 SVG path 整体平移（PathModel；保留 C） */
 export function translateSvgPath(pathData: string, dx: number, dy: number): string {
-  if (!pathData.trim() || (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6)) return pathData
-  const normalized = pathData
-      .replace(/,/g, ' ')
-      .replace(/([MLCQZAHV])/gi, ' $1 ')
-      .trim()
-  const tokens = normalized.split(/\s+/)
-  const out: string[] = []
-  let i = 0
-  let cmd: string | null = null
-  while (i < tokens.length) {
-    const tok = tokens[i]
-    if (/^[MLCQZ]$/i.test(tok)) {
-      cmd = tok.toUpperCase()
-      out.push(cmd)
-      i++
-      continue
-    }
-    if (!cmd) {
-      i++
-      continue
-    }
-    if (cmd === 'M' || cmd === 'L') {
-      if (i + 1 >= tokens.length) break
-      const x = parseFloat(tokens[i]) + dx
-      const y = parseFloat(tokens[i + 1]) + dy
-      out.push(String(x), String(y))
-      cmd = 'L'
-      i += 2
-    } else if (cmd === 'C') {
-      if (i + 5 >= tokens.length) break
-      for (let k = 0; k < 6; k += 2) {
-        out.push(String(parseFloat(tokens[i + k]) + dx))
-        out.push(String(parseFloat(tokens[i + k + 1]) + dy))
-      }
-      i += 6
-    } else if (cmd === 'Z') {
-      i++
-    } else {
-      i++
-    }
-  }
-  return out.join(' ')
+  return translateSvgPathViaModel(pathData, dx, dy)
 }
 
-/** 局部 path 随 Boundary 缩放（Transformer 缩放后写回 pathData） */
+/** 局部 path 随 Boundary 缩放（PathModel；保留 C） */
 export function scaleLocalPath(pathData: string, sx: number, sy: number): string {
-  if (!pathData.trim()) return pathData
-  const normalized = pathData
-      .replace(/,/g, ' ')
-      .replace(/([MLCQZ])/gi, ' $1 ')
-      .trim()
-  const tokens = normalized.split(/\s+/)
-  const out: string[] = []
-  let i = 0
-  let cmd: string | null = null
-  while (i < tokens.length) {
-    const tok = tokens[i]
-    if (/^[MLCQZ]$/i.test(tok)) {
-      cmd = tok.toUpperCase()
-      out.push(cmd)
-      i++
-      continue
-    }
-    if (!cmd) {
-      i++
-      continue
-    }
-    if (cmd === 'M' || cmd === 'L') {
-      if (i + 1 >= tokens.length) break
-      out.push(String(parseFloat(tokens[i]) * sx))
-      out.push(String(parseFloat(tokens[i + 1]) * sy))
-      cmd = 'L'
-      i += 2
-    } else if (cmd === 'C') {
-      if (i + 5 >= tokens.length) break
-      for (let k = 0; k < 6; k += 2) {
-        out.push(String(parseFloat(tokens[i + k]) * sx))
-        out.push(String(parseFloat(tokens[i + k + 1]) * sy))
-      }
-      i += 6
-    } else if (cmd === 'Z') {
-      i++
-    } else {
-      i++
-    }
-  }
-  return out.join(' ')
+  return scaleLocalPathViaModel(pathData, sx, sy)
 }

@@ -20,7 +20,27 @@ import {
 } from '@/utils/textBounds'
 import {
     buildLineShape, buildRectShape, buildEllipseShape, buildPolylineShape, translateSvgPath,
+    type PathShapeResult,
 } from '@/utils/pathShape'
+import { normalizeElementPathIfNeeded } from '@/utils/pathModel'
+import {
+    parsePathModel,
+    extractAnchors,
+    translateAnchors,
+    insertMidpointOnSegment,
+    deleteAnchors,
+    rebakeLocalPath,
+    findNearestStraightSegment,
+    extractHandles,
+    moveHandle,
+    inferAnchorSmoothMode,
+    cycleAnchorSmoothMode,
+    buildPathFromPenKnots,
+    type PathAnchor,
+    type PathHandle,
+    type AnchorSmoothMode,
+    type PenKnot,
+} from '@/utils/pathModel'
 import type { ElementSyncItem } from '@/api/ofdApi'
 import type { ExportPagesOptions } from '@/utils/exportPageImage'
 import { effectivePageSizeMm, normalizeViewRotation } from '@/utils/viewRotation'
@@ -321,24 +341,31 @@ export const useEditorStore = defineStore('editor', () => {
 
     const isHandTool = computed(() => currentTool.value === 'HAND')
     const isSelectTool = computed(() => currentTool.value === 'SELECT')
+    const isDirectSelectTool = computed(() => currentTool.value === 'DIRECT_SELECT')
     const isTypewriterTool = computed(() => currentTool.value === 'TYPEWRITER')
     const isVectorTool = computed(() =>
         currentTool.value === 'VECTOR_LINE'
         || currentTool.value === 'VECTOR_RECT'
         || currentTool.value === 'VECTOR_ELLIPSE'
         || currentTool.value === 'VECTOR_POLYLINE'
-        || currentTool.value === 'VECTOR_POLYGON',
+        || currentTool.value === 'VECTOR_POLYGON'
+        || currentTool.value === 'VECTOR_PEN',
     )
     const isPolylineTool = computed(() =>
         currentTool.value === 'VECTOR_POLYLINE'
         || currentTool.value === 'VECTOR_POLYGON',
     )
+    const isPenTool = computed(() => currentTool.value === 'VECTOR_PEN')
     const isAnnotationTool = computed(() =>
         currentTool.value !== 'SELECT'
         && currentTool.value !== 'HAND'
         && currentTool.value !== 'TYPEWRITER'
+        && currentTool.value !== 'DIRECT_SELECT'
         && !isVectorTool.value
     )
+
+    /** 直接选择：当前选中的锚点下标 */
+    const selectedAnchorIndices = ref<number[]>([])
 
     const hasPendingStamp = computed(() => !!pendingStampImage.value)
 
@@ -635,20 +662,12 @@ export const useEditorStore = defineStore('editor', () => {
         return id
     }
 
-    function addVectorPolyline(
-        pageIndex: number,
-        points: { x: number; y: number }[],
-        closed: boolean,
-    ): string | null {
-        if (!document.value || points.length < 2) return null
+    function pushNewPathElement(pageIndex: number, shape: PathShapeResult, fillOn: boolean): string | null {
+        if (!document.value) return null
         const page = document.value.pages[pageIndex]
         if (!page) return null
-
-        const shape = buildPolylineShape(points, closed)
-        const fillOn = closed && vectorFillEnabled.value
         const strokeOn = vectorStrokeEnabled.value
         const id = newElementId('path', page.elements.length)
-
         const element: ElementData = {
             id,
             type: 'PATH',
@@ -677,7 +696,6 @@ export const useEditorStore = defineStore('editor', () => {
             originalHeight: shape.height,
             originalRotation: 0,
         }
-
         page.elements.push(element)
         selectedElementId.value = id
         selectedAnnotationId.value = null
@@ -685,6 +703,32 @@ export const useEditorStore = defineStore('editor', () => {
         saveToHistory()
         schedulePageThumbnailRefresh(pageIndex, 300)
         return id
+    }
+
+    function addVectorPolyline(
+        pageIndex: number,
+        points: { x: number; y: number }[],
+        closed: boolean,
+    ): string | null {
+        if (!document.value || points.length < 2) return null
+        if (!document.value.pages[pageIndex]) return null
+        const shape = buildPolylineShape(points, closed)
+        const fillOn = closed && vectorFillEnabled.value
+        return pushNewPathElement(pageIndex, shape, fillOn)
+    }
+
+    /** 钢笔：页坐标结点（可含 C）→ 局部 PATH 元素 */
+    function addVectorFromPenKnots(
+        pageIndex: number,
+        knots: PenKnot[],
+        closed: boolean,
+    ): string | null {
+        if (!document.value || knots.length < 2) return null
+        if (!document.value.pages[pageIndex]) return null
+        const model = buildPathFromPenKnots(knots, closed)
+        const baked = rebakeLocalPath(model, 0, 0)
+        const fillOn = closed && vectorFillEnabled.value
+        return pushNewPathElement(pageIndex, baked, fillOn)
     }
 
     function setVectorStrokeColor(color: string) {
@@ -1133,13 +1177,49 @@ export const useEditorStore = defineStore('editor', () => {
         }
     }
 
+    /**
+     * 首次选中页坐标 PATH 时规范化为 pathLocalCoords（P0-3）。
+     * 拖移/缩放前完成，避免旧路径飘移；保留 C 段（P0-4）。
+     */
+    function ensureSelectedPathNormalized() {
+        const page = currentPage.value
+        const id = selectedElementId.value
+        if (!page || !id) return
+        const el = page.elements.find((e) => e.id === id)
+        if (!el || el.type !== 'PATH') return
+        const normalized = normalizeElementPathIfNeeded(el)
+        if (!normalized) return
+        updateElement(currentPageIndex.value, id, {
+            pathData: normalized.pathData,
+            x: normalized.x,
+            y: normalized.y,
+            width: normalized.width,
+            height: normalized.height,
+            pathLocalCoords: true,
+        })
+    }
+
     function selectElement(id: string | null) {
+        // 同一元素再次点选时保留锚点选中（直接选择下很常见）
+        if (id && id === selectedElementId.value) {
+            selectedAnnotationId.value = null
+            const el = currentPage.value?.elements.find((e) => e.id === id)
+            if (el?.type === 'PATH') {
+                syncVectorStyleFromElement(el)
+                ensureSelectedPathNormalized()
+            }
+            return
+        }
         selectedElementId.value = id
+        clearPathAnchorSelection()
         if (id) {
             selectedAnnotationId.value = null
             const el = currentPage.value?.elements.find((e) => e.id === id)
             if (el?.type === 'TEXT') syncTypewriterStyleFromElement(el)
-            if (el?.type === 'PATH') syncVectorStyleFromElement(el)
+            if (el?.type === 'PATH') {
+                syncVectorStyleFromElement(el)
+                ensureSelectedPathNormalized()
+            }
         }
     }
 
@@ -1864,10 +1944,177 @@ export const useEditorStore = defineStore('editor', () => {
     }
 
     // ==================== 注释方法 ====================
+    function clearPathAnchorSelection() {
+        selectedAnchorIndices.value = []
+    }
+
+    function setSelectedAnchors(indices: number[]) {
+        selectedAnchorIndices.value = [...new Set(indices)].sort((a, b) => a - b)
+    }
+
+    function togglePathAnchor(index: number, additive: boolean) {
+        if (!additive) {
+            selectedAnchorIndices.value = [index]
+            return
+        }
+        const set = new Set(selectedAnchorIndices.value)
+        if (set.has(index)) set.delete(index)
+        else set.add(index)
+        selectedAnchorIndices.value = [...set].sort((a, b) => a - b)
+    }
+
+    /** 按 id 在文档中查找元素（不依赖 currentPage，避免连续翻页后选中丢失） */
+    function findElementById(id: string | null): { pageIndex: number; element: ElementData } | null {
+        if (!id || !document.value) return null
+        for (let i = 0; i < document.value.pages.length; i++) {
+            const el = document.value.pages[i].elements.find((e) => e.id === id && !e.isDeleted)
+            if (el) return { pageIndex: i, element: el }
+        }
+        return null
+    }
+
+    function getSelectedPathElement(): ElementData | null {
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) return null
+        return found.element
+    }
+
+    function getPathAnchors(): PathAnchor[] {
+        const el = getSelectedPathElement()
+        if (!el?.pathData) return []
+        return extractAnchors(parsePathModel(el.pathData))
+    }
+
+    /** 拖动结束：批量平移锚点并写回（进历史） */
+    function translateSelectedPathAnchors(dxMm: number, dyMm: number): boolean {
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) return false
+        if (selectedAnchorIndices.value.length === 0) return false
+        if (found.pageIndex !== currentPageIndex.value) {
+            currentPageIndex.value = found.pageIndex
+        }
+        ensureSelectedPathNormalized()
+        const el2 = getSelectedPathElement()
+        if (!el2?.pathData) return false
+        const model = translateAnchors(
+            parsePathModel(el2.pathData),
+            selectedAnchorIndices.value,
+            dxMm,
+            dyMm,
+        )
+        const baked = rebakeLocalPath(model, el2.x, el2.y)
+        updateElement(found.pageIndex, el2.id, baked)
+        return true
+    }
+
+    /** Alt/双击直线段中点插入锚点 */
+    function insertPathAnchorAtLocalPoint(localX: number, localY: number, thresholdMm = 1.5): boolean {
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) return false
+        if (found.pageIndex !== currentPageIndex.value) {
+            currentPageIndex.value = found.pageIndex
+        }
+        ensureSelectedPathNormalized()
+        const el2 = getSelectedPathElement()
+        if (!el2?.pathData) return false
+        const model = parsePathModel(el2.pathData)
+        const seg = findNearestStraightSegment(model, localX, localY, thresholdMm)
+        if (seg === null) return false
+        const next = insertMidpointOnSegment(model, seg)
+        if (!next) return false
+        const baked = rebakeLocalPath(next, el2.x, el2.y)
+        updateElement(found.pageIndex, el2.id, baked)
+        // 新点位于 seg+1
+        selectedAnchorIndices.value = [seg + 1]
+        return true
+    }
+
+    function deleteSelectedPathAnchors(): { ok: boolean; message?: string } {
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) {
+            return { ok: false, message: '未选中路径' }
+        }
+        if (selectedAnchorIndices.value.length === 0) {
+            return { ok: false, message: '未选中锚点' }
+        }
+        if (found.pageIndex !== currentPageIndex.value) {
+            currentPageIndex.value = found.pageIndex
+        }
+        ensureSelectedPathNormalized()
+        const el2 = getSelectedPathElement()
+        if (!el2?.pathData) return { ok: false, message: '未选中路径' }
+        const result = deleteAnchors(parsePathModel(el2.pathData), selectedAnchorIndices.value)
+        if (!result.ok || !result.model) return { ok: false, message: result.message }
+        const baked = rebakeLocalPath(result.model, el2.x, el2.y)
+        updateElement(found.pageIndex, el2.id, baked)
+        clearPathAnchorSelection()
+        return { ok: true }
+    }
+
+    function getPathHandles(): PathHandle[] {
+        const el = getSelectedPathElement()
+        if (!el?.pathData) return []
+        return extractHandles(parsePathModel(el.pathData))
+    }
+
+    /**
+     * 移动贝塞尔控制柄并写回。
+     * @param mode 缺省按锚点几何推断；传 'corner' 可打断平滑（对应 Alt 拖）
+     */
+    function movePathHandle(
+        handleId: string,
+        localX: number,
+        localY: number,
+        mode?: AnchorSmoothMode,
+    ): boolean {
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) return false
+        if (found.pageIndex !== currentPageIndex.value) {
+            currentPageIndex.value = found.pageIndex
+        }
+        ensureSelectedPathNormalized()
+        const el2 = getSelectedPathElement()
+        if (!el2?.pathData) return false
+        const model = parsePathModel(el2.pathData)
+        const handle = extractHandles(model).find((h) => h.id === handleId)
+        if (!handle) return false
+        const resolved = mode ?? inferAnchorSmoothMode(model, handle.anchorIndex)
+        const next = moveHandle(model, handleId, { x: localX, y: localY }, resolved)
+        const baked = rebakeLocalPath(next, el2.x, el2.y)
+        updateElement(found.pageIndex, el2.id, baked)
+        return true
+    }
+
+    /** 双击锚点：角点 → 平滑 → 对称 循环 */
+    function cycleSelectedAnchorSmoothMode(anchorIndex: number): AnchorSmoothMode | null {
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) return null
+        if (found.pageIndex !== currentPageIndex.value) {
+            currentPageIndex.value = found.pageIndex
+        }
+        ensureSelectedPathNormalized()
+        const el2 = getSelectedPathElement()
+        if (!el2?.pathData) return null
+        const { model, mode } = cycleAnchorSmoothMode(parsePathModel(el2.pathData), anchorIndex)
+        const baked = rebakeLocalPath(model, el2.x, el2.y)
+        updateElement(found.pageIndex, el2.id, baked)
+        return mode
+    }
+
     function setTool(tool: ToolType) {
         currentTool.value = tool
         selectedAnnotationId.value = null
-        if (tool !== 'SELECT') selectedElementId.value = null
+        if (tool !== 'SELECT' && tool !== 'DIRECT_SELECT') {
+            selectedElementId.value = null
+            clearPathAnchorSelection()
+        }
+        if (tool !== 'DIRECT_SELECT') {
+            clearPathAnchorSelection()
+        } else {
+            // 切入直接选择时，若已选中 PATH 则规范化并准备锚点
+            const el = getSelectedPathElement()
+            if (el) ensureSelectedPathNormalized()
+        }
     }
 
     function setPendingStampImage(dataUrl: string) {
@@ -2322,15 +2569,15 @@ export const useEditorStore = defineStore('editor', () => {
         pageThumbnails, thumbnailLoadingPages, thumbnailLoadedCount, isGeneratingThumbnails,
         // ── 原有计算属性 ──
         currentPage, selectedElement, canDeleteSelectedElement, canUndo, canRedo, hasUnsavedChanges, isPdfDocument,
+        isHandTool, isSelectTool, isDirectSelectTool, isTypewriterTool, isVectorTool, isPolylineTool, isPenTool, isAnnotationTool,
         // ── 注释计算属性 ──
         currentPageAnnotations, selectedAnnotation,
-        isHandTool, isSelectTool, isTypewriterTool, isVectorTool, isPolylineTool, isAnnotationTool,
         // ── 原有方法 ──
         setDocument, setCurrentFile, setCurrentPage, setPageViewMode,
         registerScrollToPageInViewHook,
         registerExportCurrentPageImageHook, exportCurrentPageImage,
         registerExportPagesImageHook, exportPagesImage,
-        selectElement, setScale, fitToWidth, fitToPage,
+        selectElement, ensureSelectedPathNormalized, setScale, fitToWidth, fitToPage,
         rotateViewClockwise, rotateViewCounterClockwise, resetViewRotation,
         rotateCurrentPagePersist,
         setWatermarkConfig, watermarkConfig,
@@ -2340,9 +2587,12 @@ export const useEditorStore = defineStore('editor', () => {
         addTypewriterText, setTypewriterFontSizeMm, setTypewriterColor,
         setTypewriterFontFamily, setTypewriterBold, setTypewriterItalic, syncTypewriterStyleFromElement,
         applyTypewriterStyleToSelectedText,
-        addVectorShape, addVectorPolyline, setVectorStrokeColor, setVectorFillColor, setVectorLineWidth,
+        addVectorShape, addVectorPolyline, addVectorFromPenKnots, setVectorStrokeColor, setVectorFillColor, setVectorLineWidth,
         setVectorFillEnabled, setVectorStrokeEnabled, setVectorDashPattern, setVectorLineCap, setVectorLineJoin,
         applyVectorStyleToSelectedPath, applySaveElementSync,
+        selectedAnchorIndices, clearPathAnchorSelection, setSelectedAnchors, togglePathAnchor,
+        getPathAnchors, translateSelectedPathAnchors, insertPathAnchorAtLocalPoint, deleteSelectedPathAnchors,
+        getPathHandles, movePathHandle, cycleSelectedAnchorSmoothMode,
         alignSelectedElementToPage,
         importImageToPage, applyImageCrop,
         canCropSelectedImage, openImageCropDialog,

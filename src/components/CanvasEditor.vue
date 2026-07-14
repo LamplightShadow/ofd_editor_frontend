@@ -7,6 +7,7 @@
         'cursor-crosshair': !offscreen && (store.isAnnotationTool || store.isTypewriterTool || store.isVectorTool),
         'cursor-hand': !offscreen && store.isHandTool,
         'cursor-grabbing': !offscreen && store.isHandTool && isPanning,
+        'cursor-direct': !offscreen && store.isDirectSelectTool,
       }"
   >
     <v-stage
@@ -240,6 +241,19 @@
             v-else-if="['VECTOR_POLYLINE', 'VECTOR_POLYGON'].includes(drawTool)"
             :config="previewPolylineConfig"
         />
+        <template v-else-if="drawTool === 'VECTOR_PEN' || penActive">
+          <v-path :config="previewPenPathConfig" />
+          <v-line
+              v-for="(spk, i) in previewPenSpokeConfigs"
+              :key="'pen-spk-' + i"
+              :config="spk"
+          />
+          <v-circle
+              v-for="(dot, i) in previewPenDotConfigs"
+              :key="'pen-dot-' + i"
+              :config="dot"
+          />
+        </template>
         <v-line
             v-else-if="drawTool === 'FREEHAND'"
             :config="previewFreehandConfig"
@@ -277,6 +291,43 @@
               :config="rc"
           />
         </template>
+      </v-layer>
+
+      <!-- PATH 锚点 / 贝塞尔手柄编辑层：置于最顶，与 Transformer 互斥 -->
+      <v-layer v-if="!offscreen && pathEditVisible">
+        <v-line
+            v-for="(seg, si) in pathEditSegmentHits"
+            :key="'seg-' + si"
+            :config="seg"
+            @dblclick="(e: any) => handlePathSegmentDblClick(e, si)"
+        />
+        <v-line
+            v-for="line in pathHandleSpokeConfigs"
+            :key="'spoke-' + line.id"
+            :config="line.config"
+        />
+        <v-rect
+            v-if="anchorMarquee"
+            :config="anchorMarqueeConfig"
+        />
+        <v-circle
+            v-for="h in pathHandleConfigs"
+            :key="'hdl-' + h.id"
+            :config="h.config"
+            @mousedown="(e: any) => handleBezierHandleMouseDown(e, h.id)"
+            @dragmove="(e: any) => handleBezierHandleDragMove(e, h.id)"
+            @dragend="(e: any) => handleBezierHandleDragEnd(e, h.id)"
+        />
+        <v-circle
+            v-for="a in pathEditAnchorConfigs"
+            :key="'anc-' + a.id"
+            :config="a.config"
+            @mousedown="(e: any) => handleAnchorMouseDown(e, a.index)"
+            @dragmove="(e: any) => handleAnchorDragMove(e, a.index)"
+            @dragend="(e: any) => handleAnchorDragEnd(e, a.index)"
+            @click="(e: any) => handleAnchorClick(e, a.index)"
+            @dblclick="(e: any) => handleAnchorDblClick(e, a.index)"
+        />
       </v-layer>
     </v-stage>
 
@@ -336,6 +387,17 @@ import { effectivePageSizeMm, konvaStageRotationConfig, normalizeViewRotation } 
 import { renderPdfPage, type PageTextItem } from '@/utils/pdfRender'
 import { buildSquigglyRelativePoints, relativePointsToKonva } from '@/utils/markupPath'
 import { scaleLocalPath, translateSvgPath } from '@/utils/pathShape'
+import {
+  extractAnchors,
+  extractHandles,
+  inferAnchorSmoothMode,
+  moveHandle,
+  parsePathModel,
+  serializePathModel,
+  buildPenPreviewModel,
+  mirrorHandle,
+  type PenKnot,
+} from '@/utils/pathModel'
 import { dashPatternToKonva, normalizeLineCap, normalizeLineJoin } from '@/utils/pathStyle'
 import { lineHeightRatio, normalizeTextAlign } from '@/utils/textLayout'
 import LinkActionDialog from '@/components/LinkActionDialog.vue'
@@ -643,9 +705,9 @@ function cancelPolylineDraw() {
   stopPolylineSession()
 }
 
-async function finishPolylineDraw() {
+async function finishPolylineDraw(forceClosed?: boolean) {
   if (!polylineActive.value) return
-  const closed = store.currentTool === 'VECTOR_POLYGON'
+  const closed = forceClosed ?? (store.currentTool === 'VECTOR_POLYGON')
   if (polylinePoints.value.length < 2) {
     cancelPolylineDraw()
     return
@@ -663,10 +725,21 @@ async function finishPolylineDraw() {
 
 function onPolylineKeydown(e: KeyboardEvent) {
   if (props.offscreen || props.pageIndex !== store.currentPageIndex) return
+  if (penActive.value) {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      void finishPenDraw(false)
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      cancelPenDraw()
+      store.setTool('SELECT')
+    }
+    return
+  }
   if (!polylineActive.value) return
   if (e.key === 'Enter') {
     e.preventDefault()
-    void finishPolylineDraw()
+    void finishPolylineDraw(false)
   } else if (e.key === 'Escape') {
     e.preventDefault()
     cancelPolylineDraw()
@@ -680,8 +753,135 @@ watch(
       if (tool !== 'VECTOR_POLYLINE' && tool !== 'VECTOR_POLYGON') {
         cancelPolylineDraw()
       }
+      if (tool !== 'VECTOR_PEN') {
+        cancelPenDraw()
+      }
     },
 )
+
+// ─────────────────────────────────────────────
+// P2-2 钢笔（贝塞尔）：点击落点，拖拽出控制柄
+// ─────────────────────────────────────────────
+const PEN_DRAG_THRESHOLD_MM = 0.8
+const PEN_CLOSE_THRESHOLD_MM = 2.5
+
+const penActive = ref(false)
+const penKnots = ref<PenKnot[]>([])
+const penCursor = ref<{ x: number; y: number } | null>(null)
+const penPlacing = ref(false)
+const penDraftPoint = ref<{ x: number; y: number } | null>(null)
+const penDraftOut = ref<{ x: number; y: number } | null>(null)
+const penClosing = ref(false)
+
+function cancelPenDraw() {
+  penActive.value = false
+  penKnots.value = []
+  penCursor.value = null
+  penPlacing.value = false
+  penDraftPoint.value = null
+  penDraftOut.value = null
+  penClosing.value = false
+  window.removeEventListener('mousemove', onPenPlaceMove)
+  window.removeEventListener('mouseup', onPenPlaceUp)
+  window.removeEventListener('mousemove', onPenCursorMove)
+}
+
+function startPenCursorTrack() {
+  window.addEventListener('mousemove', onPenCursorMove)
+}
+
+function onPenCursorMove(e: MouseEvent) {
+  if (!penActive.value || penPlacing.value) return
+  const pos = getStagePosFromClient(e)
+  if (pos) penCursor.value = { x: pos.x, y: pos.y }
+}
+
+async function finishPenDraw(closed: boolean) {
+  if (!penActive.value) return
+  if (penKnots.value.length < 2) {
+    cancelPenDraw()
+    return
+  }
+  if (closed && penKnots.value.length < 3) {
+    ElMessage.warning('闭合路径至少需要 3 个点')
+    return
+  }
+  const knots = penKnots.value.map((k) => ({
+    point: { ...k.point },
+    inHandle: k.inHandle ? { ...k.inHandle } : null,
+    outHandle: k.outHandle ? { ...k.outHandle } : null,
+  }))
+  cancelPenDraw()
+  await waitForKonvaSettle()
+  store.addVectorFromPenKnots(props.pageIndex, knots, closed)
+  store.setTool('DIRECT_SELECT')
+}
+
+function beginPenPlace(pos: { x: number; y: number }, closing: boolean) {
+  penPlacing.value = true
+  penClosing.value = closing
+  penDraftPoint.value = { x: pos.x, y: pos.y }
+  penDraftOut.value = null
+  penCursor.value = { x: pos.x, y: pos.y }
+  window.addEventListener('mousemove', onPenPlaceMove)
+  window.addEventListener('mouseup', onPenPlaceUp)
+}
+
+function onPenPlaceMove(e: MouseEvent) {
+  if (!penPlacing.value || !penDraftPoint.value) return
+  const pos = getStagePosFromClient(e) ?? getStagePos()
+  if (!pos) return
+  penCursor.value = { x: pos.x, y: pos.y }
+  const o = penDraftPoint.value
+  if (Math.hypot(pos.x - o.x, pos.y - o.y) >= PEN_DRAG_THRESHOLD_MM) {
+    penDraftOut.value = { x: pos.x, y: pos.y }
+  } else {
+    penDraftOut.value = null
+  }
+}
+
+function onPenPlaceUp() {
+  window.removeEventListener('mousemove', onPenPlaceMove)
+  window.removeEventListener('mouseup', onPenPlaceUp)
+  if (!penPlacing.value || !penDraftPoint.value) {
+    penPlacing.value = false
+    return
+  }
+  const point = { ...penDraftPoint.value }
+  const out = penDraftOut.value ? { ...penDraftOut.value } : null
+  const inn = out ? mirrorHandle(point, out) : null
+  penPlacing.value = false
+  penDraftPoint.value = null
+  penDraftOut.value = null
+
+  if (penClosing.value) {
+    // 闭合：把拖出的柄写到首点入柄
+    if (penKnots.value.length >= 3) {
+      const first = penKnots.value[0]
+      if (inn) {
+        penKnots.value[0] = {
+          ...first,
+          inHandle: inn,
+          // 若首点尚无出柄且拖了，也可用 out 作为首点出柄（闭合 C 的 cp1 来自末点）
+        }
+      }
+      void finishPenDraw(true)
+    }
+    penClosing.value = false
+    return
+  }
+
+  penKnots.value.push({
+    point,
+    inHandle: inn,
+    outHandle: out,
+  })
+  if (!penActive.value) {
+    penActive.value = true
+    drawTool.value = 'VECTOR_PEN'
+    startPenCursorTrack()
+  }
+}
 
 const transformerConfig = {
   rotateEnabled: true,
@@ -888,7 +1088,7 @@ async function refreshElementTransformer(elementId: string) {
 
 watch(() => store.selectedElementId, async (id) => {
   if (props.offscreen) return
-  if (id) await refreshElementTransformer(id)
+  if (id && store.isSelectTool) await refreshElementTransformer(id)
   else {
     await nextTick()
     const transformer = transformerRef.value?.getNode()
@@ -897,6 +1097,424 @@ watch(() => store.selectedElementId, async (id) => {
     transformer.getLayer()?.batchDraw()
   }
 })
+
+watch(() => store.currentTool, async (tool) => {
+  if (props.offscreen) return
+  if (tool !== 'SELECT') {
+    await nextTick()
+    const transformer = transformerRef.value?.getNode()
+    if (!transformer) return
+    transformer.nodes([])
+    transformer.getLayer()?.batchDraw()
+  } else if (store.selectedElementId) {
+    await refreshElementTransformer(store.selectedElementId)
+  }
+})
+
+// ─────────────────────────────────────────────
+// P1 直接选择 · PATH 锚点 overlay
+// ─────────────────────────────────────────────
+/** 本页是否拥有当前选中的 PATH（连续视图下勿在其它页画幽灵锚点） */
+const pathEditElement = computed(() => {
+  if (props.offscreen || !store.isDirectSelectTool || !store.selectedElementId) return null
+  const el = props.page.elements.find(e => e.id === store.selectedElementId && !e.isDeleted)
+  if (!el || el.type !== 'PATH' || !el.pathData) return null
+  return el
+})
+
+const pathEditVisible = computed(() => !!pathEditElement.value)
+
+/** 拖动主锚点索引；拖动期间冻结 overlay 配置，避免 Vue setAttrs 打断 Konva drag */
+const draggingAnchorIndex = ref<number | null>(null)
+const anchorDragging = ref(false)
+const anchorMarquee = ref<{ x0: number; y0: number; x1: number; y1: number } | null>(null)
+let anchorMarqueeActive = false
+/** 拖动开始时各选中锚点的局部坐标 */
+let anchorDragStarts: Record<number, { x: number; y: number }> = {}
+
+const pathEditAnchors = computed(() => {
+  const el = pathEditElement.value
+  if (!el?.pathData) return []
+  return extractAnchors(parsePathModel(el.pathData))
+})
+
+function buildPathEditAnchorConfigs() {
+  const el = pathEditElement.value
+  if (!el) return [] as { id: string; index: number; config: Record<string, unknown> }[]
+  const ox = el.pathLocalCoords ? el.x : 0
+  const oy = el.pathLocalCoords ? el.y : 0
+  const selected = new Set(store.selectedAnchorIndices)
+  return pathEditAnchors.value.map((a) => {
+    const on = selected.has(a.index)
+    const x = ox + a.point.x
+    const y = oy + a.point.y
+    return {
+      id: `${el.id}-${a.index}`,
+      index: a.index,
+      config: {
+        id: `path-anchor-${a.index}`,
+        name: `path-anchor-${a.index}`,
+        x: s(x),
+        y: s(y),
+        radius: on ? 5 : 4,
+        fill: on ? '#1a73e8' : '#ffffff',
+        stroke: '#1a73e8',
+        strokeWidth: 1.5,
+        hitStrokeWidth: 12,
+        draggable: true,
+        listening: true,
+      },
+    }
+  })
+}
+
+/** 拖动中不更新，防止 Vue 把节点坐标刷回起点 */
+const pathEditAnchorConfigs = ref(buildPathEditAnchorConfigs())
+
+/** 贝塞尔手柄拖动状态（须在 watch 之前声明） */
+const handleDragging = ref(false)
+let handleDragBreakCorner = false
+let handleDragAnchorIndex = -1
+const pathHandleConfigs = ref<{ id: string; config: Record<string, unknown> }[]>([])
+const pathHandleSpokeConfigs = ref<{ id: string; config: Record<string, unknown> }[]>([])
+
+function visiblePathHandles() {
+  const el = pathEditElement.value
+  if (!el?.pathData) return []
+  const all = extractHandles(parsePathModel(el.pathData))
+  if (store.selectedAnchorIndices.length === 0) return all
+  const sel = new Set(store.selectedAnchorIndices)
+  return all.filter((h) => sel.has(h.anchorIndex))
+}
+
+function rebuildPathHandleOverlay() {
+  if (handleDragging.value) return
+  const el = pathEditElement.value
+  if (!el) {
+    pathHandleConfigs.value = []
+    pathHandleSpokeConfigs.value = []
+    return
+  }
+  const ox = el.pathLocalCoords ? el.x : 0
+  const oy = el.pathLocalCoords ? el.y : 0
+  const anchors = pathEditAnchors.value
+  const handles = visiblePathHandles()
+  pathHandleSpokeConfigs.value = handles.map((h) => {
+    const a = anchors[h.anchorIndex]
+    return {
+      id: h.id,
+      config: {
+        name: `path-spoke-${h.id}`,
+        points: a
+            ? [s(ox + a.point.x), s(oy + a.point.y), s(ox + h.point.x), s(oy + h.point.y)]
+            : [],
+        stroke: '#1a73e8',
+        strokeWidth: 1,
+        dash: [3, 3],
+        listening: false,
+      },
+    }
+  })
+  pathHandleConfigs.value = handles.map((h) => ({
+    id: h.id,
+    config: {
+      id: `path-handle-${h.id.replace(':', '-')}`,
+      name: `path-handle-${h.id}`,
+      x: s(ox + h.point.x),
+      y: s(oy + h.point.y),
+      radius: 3.5,
+      fill: '#1a73e8',
+      stroke: '#ffffff',
+      strokeWidth: 1,
+      hitStrokeWidth: 10,
+      draggable: true,
+      listening: true,
+    },
+  }))
+}
+
+watch(
+    [
+      pathEditElement,
+      pathEditAnchors,
+      () => store.selectedAnchorIndices.slice(),
+      () => renderScale.value,
+      () => store.scale,
+    ],
+    () => {
+      if (anchorDragging.value || handleDragging.value) return
+      pathEditAnchorConfigs.value = buildPathEditAnchorConfigs()
+      rebuildPathHandleOverlay()
+    },
+    { immediate: true, deep: true },
+)
+
+function handleBezierHandleMouseDown(e: any, handleId: string) {
+  e.cancelBubble = true
+  handleDragging.value = true
+  handleDragBreakCorner = !!(e.evt?.altKey)
+  const el = pathEditElement.value
+  if (!el?.pathData) return
+  const h = extractHandles(parsePathModel(el.pathData)).find((x) => x.id === handleId)
+  handleDragAnchorIndex = h?.anchorIndex ?? -1
+  if (h && !store.selectedAnchorIndices.includes(h.anchorIndex)) {
+    store.setSelectedAnchors([h.anchorIndex])
+  }
+}
+
+function handleBezierHandleDragMove(e: any, handleId: string) {
+  e.cancelBubble = true
+  const el = pathEditElement.value
+  if (!el?.pathData || !handleDragging.value) return
+  const ox = el.pathLocalCoords ? el.x : 0
+  const oy = el.pathLocalCoords ? el.y : 0
+  const localX = px2mm(e.target.x()) - ox
+  const localY = px2mm(e.target.y()) - oy
+  const stage = stageRef.value?.getNode?.()
+  const a = pathEditAnchors.value[handleDragAnchorIndex]
+  if (!a) return
+
+  const spoke = pathHandleSpokeConfigs.value.find((s) => s.id === handleId)
+  if (spoke) {
+    spoke.config = {
+      ...spoke.config,
+      points: [s(ox + a.point.x), s(oy + a.point.y), s(ox + localX), s(oy + localY)],
+    }
+  }
+
+  const model = parsePathModel(el.pathData)
+  const resolved = handleDragBreakCorner
+      ? 'corner' as const
+      : inferAnchorSmoothMode(model, handleDragAnchorIndex)
+  if (resolved === 'corner' || !stage) return
+
+  const preview = moveHandle(model, handleId, { x: localX, y: localY }, resolved)
+  const twin = extractHandles(preview).find(
+      (t) => t.anchorIndex === handleDragAnchorIndex && t.id !== handleId,
+  )
+  if (!twin) return
+  const node = stage.findOne(`#path-handle-${twin.id.replace(':', '-')}`)
+  if (node) node.position({ x: s(ox + twin.point.x), y: s(oy + twin.point.y) })
+  const twinSpoke = pathHandleSpokeConfigs.value.find((s) => s.id === twin.id)
+  if (twinSpoke) {
+    twinSpoke.config = {
+      ...twinSpoke.config,
+      points: [
+        s(ox + a.point.x), s(oy + a.point.y),
+        s(ox + twin.point.x), s(oy + twin.point.y),
+      ],
+    }
+  }
+}
+
+function handleBezierHandleDragEnd(e: any, handleId: string) {
+  e.cancelBubble = true
+  const el = pathEditElement.value
+  const ox = el?.pathLocalCoords ? el.x : 0
+  const oy = el?.pathLocalCoords ? el.y : 0
+  const localX = px2mm(e.target.x()) - ox
+  const localY = px2mm(e.target.y()) - oy
+  const breakCorner = handleDragBreakCorner
+  handleDragging.value = false
+  handleDragBreakCorner = false
+  handleDragAnchorIndex = -1
+  const mode = breakCorner ? 'corner' as const : undefined
+  if (store.movePathHandle(handleId, localX, localY, mode)) {
+    suppressClick.value = true
+  }
+  pathEditAnchorConfigs.value = buildPathEditAnchorConfigs()
+  rebuildPathHandleOverlay()
+}
+
+function handleAnchorDblClick(e: any, index: number) {
+  e.cancelBubble = true
+  e.evt?.preventDefault?.()
+  const mode = store.cycleSelectedAnchorSmoothMode(index)
+  if (mode) {
+    const label = mode === 'corner' ? '角点' : mode === 'smooth' ? '平滑' : '对称'
+    ElMessage.success({ message: `锚点模式：${label}`, duration: 1000, showClose: false })
+  }
+  rebuildPathHandleOverlay()
+}
+
+/** 不可见宽线段，便于双击插入中点 */
+const pathEditSegmentHits = computed(() => {
+  const el = pathEditElement.value
+  if (!el?.pathData) return [] as Record<string, unknown>[]
+  const model = parsePathModel(el.pathData)
+  const anchors = extractAnchors(model)
+  const ox = el.pathLocalCoords ? el.x : 0
+  const oy = el.pathLocalCoords ? el.y : 0
+  const segs: Record<string, unknown>[] = []
+  for (let i = 0; i < anchors.length - 1; i++) {
+    const b = anchors[i + 1]
+    if (model.commands[b.commandIndex]?.type !== 'L') continue
+    const a = anchors[i]
+    segs.push({
+      name: `path-seg-${i}`,
+      points: [s(ox + a.point.x), s(oy + a.point.y), s(ox + b.point.x), s(oy + b.point.y)],
+      stroke: 'transparent',
+      strokeWidth: 14,
+      listening: true,
+    })
+  }
+  return segs
+})
+
+const anchorMarqueeConfig = computed(() => {
+  const m = anchorMarquee.value
+  if (!m) return {}
+  const x = Math.min(m.x0, m.x1)
+  const y = Math.min(m.y0, m.y1)
+  const w = Math.abs(m.x1 - m.x0)
+  const h = Math.abs(m.y1 - m.y0)
+  return {
+    x: s(x),
+    y: s(y),
+    width: s(w),
+    height: s(h),
+    fill: 'rgba(26,115,232,0.12)',
+    stroke: '#1a73e8',
+    strokeWidth: 1,
+    dash: [4, 4],
+    listening: false,
+  }
+})
+
+function handleAnchorClick(e: any, index: number) {
+  e.cancelBubble = true
+  if (suppressClick.value) return
+  const additive = !!(e.evt?.shiftKey || e.evt?.ctrlKey || e.evt?.metaKey)
+  store.togglePathAnchor(index, additive)
+}
+
+function handleAnchorMouseDown(e: any, index: number) {
+  e.cancelBubble = true
+  const additive = !!(e.evt?.shiftKey || e.evt?.ctrlKey || e.evt?.metaKey)
+  if (!store.selectedAnchorIndices.includes(index) && !additive) {
+    store.setSelectedAnchors([index])
+  } else if (!store.selectedAnchorIndices.includes(index) && additive) {
+    store.togglePathAnchor(index, true)
+  }
+  const el = pathEditElement.value
+  if (!el) return
+  draggingAnchorIndex.value = index
+  anchorDragging.value = true
+  anchorDragStarts = {}
+  for (const a of pathEditAnchors.value) {
+    if (store.selectedAnchorIndices.includes(a.index) || a.index === index) {
+      anchorDragStarts[a.index] = { x: a.point.x, y: a.point.y }
+    }
+  }
+}
+
+function handleAnchorDragMove(e: any, index: number) {
+  e.cancelBubble = true
+  const el = pathEditElement.value
+  if (!el || !anchorDragging.value) return
+  const ox = el.pathLocalCoords ? el.x : 0
+  const oy = el.pathLocalCoords ? el.y : 0
+  const start = anchorDragStarts[index]
+  if (!start) return
+  const dx = px2mm(e.target.x()) - (ox + start.x)
+  const dy = px2mm(e.target.y()) - (oy + start.y)
+  // 多选时命令式移动其余锚点（不触发 Vue 配置刷新）
+  const stage = stageRef.value?.getNode?.()
+  if (!stage) return
+  for (const i of Object.keys(anchorDragStarts).map(Number)) {
+    if (i === index) continue
+    const s0 = anchorDragStarts[i]
+    if (!s0) continue
+    const node = stage.findOne(`#path-anchor-${i}`)
+    if (node) {
+      node.position({ x: s(ox + s0.x + dx), y: s(oy + s0.y + dy) })
+    }
+  }
+}
+
+function handleAnchorDragEnd(e: any, index: number) {
+  e.cancelBubble = true
+  const el = pathEditElement.value
+  const start = anchorDragStarts[index]
+  const ox = el?.pathLocalCoords ? el.x : 0
+  const oy = el?.pathLocalCoords ? el.y : 0
+  let dx = 0
+  let dy = 0
+  if (el && start) {
+    dx = px2mm(e.target.x()) - (ox + start.x)
+    dy = px2mm(e.target.y()) - (oy + start.y)
+  }
+  anchorDragging.value = false
+  draggingAnchorIndex.value = null
+  anchorDragStarts = {}
+  if (Math.abs(dx) > 1e-6 || Math.abs(dy) > 1e-6) {
+    if (!store.selectedAnchorIndices.includes(index)) {
+      store.setSelectedAnchors([index])
+    }
+    store.translateSelectedPathAnchors(dx, dy)
+    suppressClick.value = true
+  }
+  pathEditAnchorConfigs.value = buildPathEditAnchorConfigs()
+  rebuildPathHandleOverlay()
+}
+
+function handlePathSegmentDblClick(e: any, segIndex: number) {
+  e.cancelBubble = true
+  e.evt?.preventDefault?.()
+  const el = pathEditElement.value
+  if (!el?.pathData) return
+  const model = parsePathModel(el.pathData)
+  const anchors = extractAnchors(model)
+  const a = anchors[segIndex]
+  const b = anchors[segIndex + 1]
+  if (!a || !b) return
+  const midX = (a.point.x + b.point.x) / 2
+  const midY = (a.point.y + b.point.y) / 2
+  if (store.insertPathAnchorAtLocalPoint(midX, midY, 999)) {
+    ElMessage.success({ message: '已插入锚点', duration: 1000, showClose: false })
+  }
+}
+
+function finishAnchorMarquee(additive: boolean) {
+  const m = anchorMarquee.value
+  anchorMarquee.value = null
+  anchorMarqueeActive = false
+  if (!m || !pathEditVisible.value) return
+  const el = pathEditElement.value
+  if (!el) return
+  const ox = el.pathLocalCoords ? el.x : 0
+  const oy = el.pathLocalCoords ? el.y : 0
+  const left = Math.min(m.x0, m.x1)
+  const right = Math.max(m.x0, m.x1)
+  const top = Math.min(m.y0, m.y1)
+  const bottom = Math.max(m.y0, m.y1)
+  if (right - left < 0.3 && bottom - top < 0.3) return
+  const hit: number[] = []
+  for (const a of pathEditAnchors.value) {
+    const x = ox + a.point.x
+    const y = oy + a.point.y
+    if (x >= left && x <= right && y >= top && y <= bottom) hit.push(a.index)
+  }
+  if (additive) {
+    store.setSelectedAnchors([...new Set([...store.selectedAnchorIndices, ...hit])])
+  } else {
+    store.setSelectedAnchors(hit)
+  }
+}
+
+function onWindowAnchorMarqueeMove(e: MouseEvent) {
+  if (!anchorMarqueeActive || !anchorMarquee.value) return
+  const pos = getStagePosFromClient(e) ?? getStagePos()
+  if (!pos) return
+  anchorMarquee.value = { ...anchorMarquee.value, x1: pos.x, y1: pos.y }
+}
+
+function onWindowAnchorMarqueeUp(e: MouseEvent) {
+  window.removeEventListener('mousemove', onWindowAnchorMarqueeMove)
+  window.removeEventListener('mouseup', onWindowAnchorMarqueeUp)
+  const additive = !!(e.shiftKey || e.ctrlKey || e.metaKey)
+  finishAnchorMarquee(additive)
+}
 
 // ─────────────────────────────────────────────
 // 注释 Transformer 跟踪
@@ -967,7 +1585,7 @@ const polylineCursor = ref<{ x: number; y: number } | null>(null)
 
 const previewLayerConfig = computed(() => ({
   listening: false,
-  visible:   isDrawing.value || polylineActive.value,
+  visible:   isDrawing.value || polylineActive.value || penActive.value || penPlacing.value,
 }))
 
 const previewRectConfig = computed(() => {
@@ -1036,6 +1654,84 @@ const previewPolylineConfig = computed(() => {
     closed:      false,
     listening:   false,
   }
+})
+
+const previewPenPathConfig = computed(() => {
+  const sc = MM_TO_PX * renderScale.value
+  const draft = penPlacing.value && penDraftPoint.value && !penClosing.value
+      ? {
+          point: penDraftPoint.value,
+          inHandle: penDraftOut.value
+              ? mirrorHandle(penDraftPoint.value, penDraftOut.value)
+              : null,
+          outHandle: penDraftOut.value,
+        }
+      : null
+  const cursor = (!penPlacing.value && penCursor.value) ? penCursor.value : null
+  const model = buildPenPreviewModel(penKnots.value, cursor, draft)
+  return {
+    data:               serializePathModel(model),
+    x:                  0,
+    y:                  0,
+    scaleX:             sc,
+    scaleY:             sc,
+    stroke:             store.vectorStrokeColor,
+    strokeWidth:        store.vectorLineWidth,
+    strokeScaleEnabled: false,
+    fill:               'transparent',
+    lineCap:            normalizeLineCap(store.vectorLineCap),
+    lineJoin:           normalizeLineJoin(store.vectorLineJoin),
+    dash:               dashPatternToKonva(store.vectorDashPattern, sc) ?? [4, 3],
+    listening:          false,
+  }
+})
+
+const previewPenSpokeConfigs = computed(() => {
+  const lines: Record<string, unknown>[] = []
+  const pushSpoke = (anchor: { x: number; y: number }, handle: { x: number; y: number } | null) => {
+    if (!handle) return
+    lines.push({
+      points: [s(anchor.x), s(anchor.y), s(handle.x), s(handle.y)],
+      stroke: '#1a73e8',
+      strokeWidth: 1,
+      dash: [3, 3],
+      listening: false,
+    })
+  }
+  for (const k of penKnots.value) {
+    pushSpoke(k.point, k.inHandle)
+    pushSpoke(k.point, k.outHandle)
+  }
+  if (penPlacing.value && penDraftPoint.value && penDraftOut.value) {
+    const p = penDraftPoint.value
+    const out = penDraftOut.value
+    pushSpoke(p, out)
+    pushSpoke(p, mirrorHandle(p, out))
+  }
+  return lines
+})
+
+const previewPenDotConfigs = computed(() => {
+  const dots: Record<string, unknown>[] = []
+  const add = (p: { x: number; y: number }, r = 3.5, fill = '#1a73e8') => {
+    dots.push({
+      x: s(p.x), y: s(p.y), radius: r,
+      fill, stroke: '#fff', strokeWidth: 1, listening: false,
+    })
+  }
+  for (const k of penKnots.value) {
+    add(k.point, 4, '#ffffff')
+    if (k.inHandle) add(k.inHandle, 3)
+    if (k.outHandle) add(k.outHandle, 3)
+  }
+  if (penPlacing.value && penDraftPoint.value) {
+    add(penDraftPoint.value, 4, '#ffffff')
+    if (penDraftOut.value) {
+      add(penDraftOut.value, 3)
+      add(mirrorHandle(penDraftPoint.value, penDraftOut.value), 3)
+    }
+  }
+  return dots
 })
 
 const previewEllipseConfig = computed(() => {
@@ -1378,6 +2074,7 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onPolylineKeydown)
   stopDrawSession()
   stopPolylineSession()
+  cancelPenDraw()
   if (pdfRenderTimer) clearTimeout(pdfRenderTimer)
 })
 
@@ -1403,12 +2100,62 @@ function handleMouseDown(e: any) {
     return
   }
 
-  // 折线 / 多边形：页内任意位置单击加点（不要求点空白处）
+  // 直接选择：仅在空白处拖出橡皮筋（点 PATH / 其它元素不抢点击）
+  if (store.isDirectSelectTool && pathEditVisible.value) {
+    const name = typeof e.target?.name === 'function' ? e.target.name() : ''
+    const isAnchor = typeof name === 'string' && name.startsWith('path-anchor-')
+    const isSeg = typeof name === 'string' && name.startsWith('path-seg-')
+    const isHandle = typeof name === 'string' && name.startsWith('path-handle-')
+    const isBackground = e.target === e.target.getStage?.() || name === 'page-bg'
+    if (isBackground && !isAnchor && !isSeg && !isHandle && e.evt?.button === 0) {
+      const pos = getStagePos()
+      if (pos) {
+        ensureActivePageForInteraction()
+        anchorMarqueeActive = true
+        anchorMarquee.value = { x0: pos.x, y0: pos.y, x1: pos.x, y1: pos.y }
+        window.addEventListener('mousemove', onWindowAnchorMarqueeMove)
+        window.addEventListener('mouseup', onWindowAnchorMarqueeUp)
+        e.evt.preventDefault()
+        return
+      }
+    }
+  }
+
+  // 钢笔（贝塞尔）：按下落点，拖拽出柄；靠近起点闭合
+  if (store.isPenTool) {
+    ensureActivePageForInteraction()
+    if (e.evt?.button === 2) {
+      e.evt.preventDefault()
+      void finishPenDraw(false)
+      return
+    }
+    if (e.evt?.button !== 0) return
+    if (e.evt.detail >= 2) return
+    const pos = getStagePos()
+    if (!pos) return
+    e.evt.preventDefault()
+    if (!penActive.value) {
+      drawTool.value = 'VECTOR_PEN'
+      beginPenPlace(pos, false)
+      return
+    }
+    if (penKnots.value.length >= 3) {
+      const first = penKnots.value[0].point
+      if (Math.hypot(pos.x - first.x, pos.y - first.y) <= PEN_CLOSE_THRESHOLD_MM) {
+        beginPenPlace(first, true)
+        return
+      }
+    }
+    beginPenPlace(pos, false)
+    return
+  }
+
+  // 折线 / 多边形：页内任意位置单击加点
   if (store.isPolylineTool) {
     ensureActivePageForInteraction()
     if (e.evt?.button === 2) {
       e.evt.preventDefault()
-      void finishPolylineDraw()
+      void finishPolylineDraw(store.currentTool === 'VECTOR_POLYGON')
       return
     }
     if (e.evt?.button !== 0) return
@@ -1598,15 +2345,49 @@ function handleMouseLeave() {
 }
 
 function handleStageContextMenu(e: any) {
-  if (props.offscreen || !store.isPolylineTool || !polylineActive.value) return
+  if (props.offscreen) return
+  if (store.isPenTool && (penActive.value || penPlacing.value)) {
+    e.evt?.preventDefault?.()
+    void finishPenDraw(false)
+    return
+  }
+  if (!store.isPolylineTool || !polylineActive.value) return
   e.evt?.preventDefault?.()
   void finishPolylineDraw()
 }
 
 function handleStageDblClick(e: any) {
-  if (props.offscreen || !store.isPolylineTool || !polylineActive.value) return
+  if (props.offscreen) return
+  if (store.isDirectSelectTool && pathEditVisible.value) {
+    const pos = getStagePos()
+    if (pos) {
+      const el = pathEditElement.value
+      if (el?.pathData) {
+        const localX = pos.x - (el.pathLocalCoords ? el.x : 0)
+        const localY = pos.y - (el.pathLocalCoords ? el.y : 0)
+        if (store.insertPathAnchorAtLocalPoint(localX, localY, 2.5)) {
+          e.evt?.preventDefault?.()
+          ElMessage.success({ message: '已插入锚点', duration: 1000, showClose: false })
+          return
+        }
+      }
+    }
+  }
+  if (store.isPenTool && penActive.value) {
+    e.evt?.preventDefault?.()
+    // 双击会多落一个点，去掉末点后结束
+    if (penKnots.value.length >= 2) {
+      const last = penKnots.value[penKnots.value.length - 1]
+      const prev = penKnots.value[penKnots.value.length - 2]
+      if (Math.hypot(last.point.x - prev.point.x, last.point.y - prev.point.y) < 0.5) {
+        penKnots.value.pop()
+      }
+    }
+    void finishPenDraw(false)
+    return
+  }
+  if (!store.isPolylineTool || !polylineActive.value) return
   e.evt?.preventDefault?.()
-  // 双击会触发两次单击，去掉紧邻的重复顶点
   const pts = polylinePoints.value
   if (pts.length >= 2) {
     const last = pts[pts.length - 1]
@@ -1635,6 +2416,17 @@ function handleStageClick(e: any) {
     if (!isBackground || !pos) return
     pendingTypewriterPos = { x: pos.x, y: pos.y }
     openTextEdit(undefined, 'typewriter')
+    return
+  }
+
+  if (store.isDirectSelectTool) {
+    if (isBackground) {
+      if (store.selectedAnchorIndices.length > 0) {
+        store.clearPathAnchorSelection()
+      } else {
+        store.selectElement(null)
+      }
+    }
     return
   }
 
@@ -1720,11 +2512,15 @@ function loadImageDimensions(src: string): Promise<{ width: number; height: numb
 
 function handleElementClick(e: any, elementId: string) {
   if (suppressClick.value) return
-  if (!store.isSelectTool) return
+  if (!store.isSelectTool && !store.isDirectSelectTool) return
   ensureActivePageForInteraction()
   const el = props.page.elements.find(item => item.id === elementId)
   if (el?.type === 'SEAL') return
   e.cancelBubble = true
+  if (store.isDirectSelectTool && el?.type !== 'PATH') {
+    ElMessage.info({ message: '直接选择仅用于 PATH 锚点编辑', duration: 1500, showClose: false })
+    return
+  }
   store.selectElement(elementId)
 }
 
@@ -2347,6 +3143,9 @@ function getPathConfig(element: ElementData) {
       ? '#1a73e8'
       : (strokeOff || (strokeW <= 0 && !isSelected) ? undefined : (e.strokeColor || '#222222'))
   const dash = dashPatternToKonva(e.dashPattern, sc)
+  // strokeScaleEnabled:false 时 stroke/hit 线宽按「屏幕像素」计。
+  // 只加大命中区，不改视觉线宽、不改 strokeScaleEnabled（避免保存后观感/坐标系异常）。
+  const hitStrokePx = Math.max(16, (strokeW > 0 ? strokeW : 0) * sc)
   return {
     id:                 element.id,
     x:                  local ? s(element.x) : 0,
@@ -2360,6 +3159,7 @@ function getPathConfig(element: ElementData) {
     stroke:             strokeCol,
     strokeWidth:        strokeW,
     strokeScaleEnabled: false,
+    hitStrokeWidth:     canStroke || isSelected || fillOff ? hitStrokePx : 0,
     dash,
     lineCap:            normalizeLineCap(e.lineCap),
     lineJoin:           normalizeLineJoin(e.lineJoin),
@@ -2862,6 +3662,10 @@ defineExpose({ captureForPrint })
 
 .canvas-wrapper.cursor-crosshair {
   cursor: crosshair;
+}
+
+.canvas-wrapper.cursor-direct {
+  cursor: default;
 }
 
 .canvas-wrapper--offscreen {

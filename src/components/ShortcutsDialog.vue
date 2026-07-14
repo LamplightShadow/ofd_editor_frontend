@@ -36,7 +36,11 @@ const SHORTCUTS: { keys: string; desc: string }[] = [
   { keys: 'Ctrl++ / Ctrl+-', desc: '放大 / 缩小' },
   { keys: 'Ctrl+0', desc: '实际大小（100%）' },
   { keys: 'PageUp / PageDown', desc: '上一页 / 下一页' },
-  { keys: 'Delete / Backspace', desc: '删除选中批注或元素' },
+  { keys: 'Delete / Backspace', desc: '删除选中批注、元素或（直接选择下）锚点' },
+  { keys: '双击锚点', desc: '直接选择：角点 / 平滑 / 对称循环' },
+  { keys: 'Alt+拖手柄', desc: '直接选择：打断平滑，独立移动控制柄' },
+  { keys: '钢笔 Enter / Esc', desc: '结束开放路径 / 取消绘制' },
+  { keys: '钢笔 拖拽', desc: '按住拖出贝塞尔控制柄；单击为角点' },
   { keys: 'Esc', desc: '取消选择 / 关闭面板' },
   { keys: 'F1 / ?', desc: '打开快捷键说明' },
 ]

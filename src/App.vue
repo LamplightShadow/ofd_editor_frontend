@@ -407,8 +407,15 @@ function handleGlobalKeydown(e: KeyboardEvent) {
 
   if (!store.document) return
 
-  // Delete / Backspace：删除选中注释或页面元素
+  // Delete / Backspace：优先删锚点，再删注释 / 元素
   if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (store.isDirectSelectTool && store.selectedAnchorIndices.length > 0) {
+      e.preventDefault()
+      const r = store.deleteSelectedPathAnchors()
+      if (r.ok) ElMessage.success('锚点已删除')
+      else if (r.message) ElMessage.warning(r.message)
+      return
+    }
     if (store.selectedAnnotationId) {
       e.preventDefault()
       void store.deleteAnnotation(store.selectedAnnotationId).then((ok) => {

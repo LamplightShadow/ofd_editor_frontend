@@ -357,9 +357,25 @@
       <template v-else-if="activeTab === 'content-edit'">
         <RibbonGroup label="模式">
           <RibbonButton label="选择" :icon="Pointer" :active="store.currentTool === 'SELECT'" @click="store.setTool('SELECT')" />
+          <RibbonButton
+              label="直接选择"
+              :icon="Aim"
+              :disabled="!store.document"
+              :active="store.currentTool === 'DIRECT_SELECT'"
+              tooltip="编辑 PATH 锚点/手柄：拖动改形、框选、Delete 删锚点、双击锚点切换角点/平滑/对称、Alt 拖柄打断平滑"
+              @click="store.setTool('DIRECT_SELECT')"
+          />
         </RibbonGroup>
         <RibbonSep />
         <RibbonGroup label="矢量">
+          <RibbonButton
+              label="钢笔"
+              :icon="EditPen"
+              :disabled="!store.document"
+              :active="store.currentTool === 'VECTOR_PEN'"
+              tooltip="钢笔：单击落角点；按住拖拽拉出贝塞尔控制柄；靠近起点闭合；Enter/双击结束；Esc 取消"
+              @click="store.setTool('VECTOR_PEN')"
+          />
           <RibbonButton
               label="直线"
               :icon="Right"
@@ -717,7 +733,7 @@ import {
   InfoFilled, Rank, FullScreen, View, Expand, Crop,
   Document, Reading, Sort, Picture, Files, PictureFilled, Monitor,
   Lock, Key, Stamp, Medal, QuestionFilled, Clock, Scissor,
-  Search, DocumentCopy, CircleCheck, Link as LinkIcon, Menu,
+  Search, DocumentCopy, CircleCheck, Link as LinkIcon, Menu, Aim,
 } from '@element-plus/icons-vue'
 import { useEditorStore } from '@/stores/editorStore'
 import { TYPEWRITER_FONT_OPTIONS } from '@/utils/typewriterFonts'

@@ -42,6 +42,8 @@ export type ToolType =
     | 'VECTOR_ELLIPSE' // 正文层矢量：椭圆
     | 'VECTOR_POLYLINE' // 正文层矢量：折线（点击加点，双击结束）
     | 'VECTOR_POLYGON' // 正文层矢量：多边形
+    | 'VECTOR_PEN'     // 钢笔：点击落 M/L，近起点闭合，Enter/Esc 结束开放路径
+    | 'DIRECT_SELECT'  // 直接选择：编辑 PATH 锚点 / 贝塞尔手柄
 
 // ========== OFD原生元素（保持不变） ==========
 export interface ElementData {
