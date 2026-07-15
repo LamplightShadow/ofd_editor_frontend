@@ -26,8 +26,12 @@ import {
   buildPathFromPenKnots,
   buildPenPreviewModel,
   mirrorHandle,
+  canRoundCorner,
+  roundCornerAtAnchor,
+  roundAllPolylineCorners,
+  findRoundableAnchorIndices,
 } from './pathModel'
-import { buildEllipsePathLocal, buildRectPathLocal } from './pathShape'
+import { buildEllipsePathLocal, buildRectPathLocal, buildCircleShape, circleBoundsFromDrag, buildSemicircleShape } from './pathShape'
 
 describe('PathModel P0-1 M/L 解析与序列化', () => {
   it('解析简单折线 M/L', () => {
@@ -343,5 +347,84 @@ describe('PathModel P2-2 钢笔贝塞尔', () => {
     )
     expect(m.commands).toHaveLength(2)
     expect(m.commands[1]).toEqual({ type: 'L', point: { x: 5, y: 5 } })
+  })
+})
+
+describe('PathModel 折线角倒圆角', () => {
+  it('直角折线中间点可倒圆并插入 C', () => {
+    const m = parsePathModel('M 0 0 L 10 0 L 10 10')
+    expect(canRoundCorner(m, 1)).toBe(true)
+    expect(canRoundCorner(m, 0)).toBe(false)
+    const next = roundCornerAtAnchor(m, 1, 2)
+    expect(next).not.toBeNull()
+    expect(next!.commands.some(c => c.type === 'C')).toBe(true)
+    expect(countCommands(next!).C).toBe(1)
+    const anchors = extractAnchors(next!)
+    // 原直角被裁成 t1 + 圆弧终点 t2，不再经过 (10,0) 尖角
+    expect(anchors.some(a => Math.abs(a.point.x - 10) < 1e-6 && Math.abs(a.point.y) < 1e-6)).toBe(false)
+  })
+
+  it('闭合矩形（Z）可对四角倒圆', () => {
+    const m = parsePathModel('M 0 0 L 20 0 L 20 20 L 0 20 Z')
+    const indices = findRoundableAnchorIndices(m)
+    expect(indices.length).toBeGreaterThanOrEqual(3)
+    const next = roundAllPolylineCorners(m, 2)
+    expect(countCommands(next).C).toBeGreaterThanOrEqual(3)
+    expect(isPathClosed(next)).toBe(true)
+  })
+
+  it('显式闭合矩形（末点回到起点）倒圆起点', () => {
+    const m = parsePathModel('M 0 0 L 20 0 L 20 20 L 0 20 L 0 0 Z')
+    expect(canRoundCorner(m, 0)).toBe(true)
+    const next = roundCornerAtAnchor(m, 0, 2)
+    expect(next).not.toBeNull()
+    expect(next!.commands[0]).toMatchObject({ type: 'M' })
+    expect(next!.commands.some(c => c.type === 'C')).toBe(true)
+  })
+
+  it('半径过大时钳制仍成功', () => {
+    const m = parsePathModel('M 0 0 L 5 0 L 5 5')
+    const next = roundCornerAtAnchor(m, 1, 100)
+    expect(next).not.toBeNull()
+    expect(countCommands(next!).C).toBe(1)
+  })
+})
+
+describe('正圆矢量 shape', () => {
+  it('拖拽非正方形时仍生成等宽高圆', () => {
+    const b = circleBoundsFromDrag(0, 0, 30, 10)
+    expect(b.diameter).toBe(30)
+    const shape = buildCircleShape(0, 0, 30, 10)
+    expect(shape.width).toBe(shape.height)
+    expect(shape.width).toBe(30)
+    expect(shape.x).toBe(0)
+    expect(shape.y).toBe(0)
+  })
+
+  it('向左上拖拽时原点向负向扩展', () => {
+    const shape = buildCircleShape(10, 10, 0, 5)
+    expect(shape.width).toBe(10)
+    expect(shape.height).toBe(10)
+    expect(shape.x).toBe(0)
+    expect(shape.y).toBe(0)
+  })
+})
+
+describe('半圆弧 shape', () => {
+  it('直径水平时两端点正确且含两段 C', () => {
+    const shape = buildSemicircleShape(0, 10, 20, 10, 1)
+    const m = parsePathModel(shape.pathData)
+    expect(countCommands(m).C).toBe(2)
+    expect(countCommands(m).Z).toBe(0)
+    const anchors = extractAnchors(m)
+    expect(anchors).toHaveLength(3) // 起点 + 弧中点(C end) + 终点
+  })
+
+  it('反转 sign 后包围盒落在直径另一侧', () => {
+    const up = buildSemicircleShape(0, 10, 20, 10, 1)
+    const down = buildSemicircleShape(0, 10, 20, 10, -1)
+    // sign=+1 弧心在 y=20；-1 在 y=0
+    expect(up.y + up.height).toBeGreaterThan(10)
+    expect(down.y).toBeLessThan(10)
   })
 })

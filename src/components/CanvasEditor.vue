@@ -230,9 +230,24 @@
             :config="previewRectConfig"
         />
         <v-ellipse
-            v-else-if="drawTool === 'CIRCLE' || drawTool === 'VECTOR_ELLIPSE'"
+            v-else-if="drawTool === 'CIRCLE' || drawTool === 'VECTOR_ELLIPSE' || drawTool === 'VECTOR_CIRCLE'"
             :config="previewEllipseConfig"
         />
+        <template v-else-if="drawTool === 'VECTOR_ARC' || (store.currentTool === 'VECTOR_ARC' && store.lastArcSession)">
+          <v-path
+              v-if="isDrawing && drawTool === 'VECTOR_ARC'"
+              :config="previewArcConfig"
+          />
+          <v-line
+              v-if="isDrawing && drawTool === 'VECTOR_ARC'"
+              :config="previewArcChordConfig"
+          />
+          <v-circle
+              v-for="(dot, i) in previewArcEndpointConfigs"
+              :key="'arc-ep-' + i"
+              :config="dot"
+          />
+        </template>
         <v-line
             v-else-if="drawTool === 'VECTOR_LINE'"
             :config="previewVectorLineConfig"
@@ -386,7 +401,7 @@ import type { PageData, ElementData, AnnotationData } from '@/types'
 import { effectivePageSizeMm, konvaStageRotationConfig, normalizeViewRotation } from '@/utils/viewRotation'
 import { renderPdfPage, type PageTextItem } from '@/utils/pdfRender'
 import { buildSquigglyRelativePoints, relativePointsToKonva } from '@/utils/markupPath'
-import { scaleLocalPath, translateSvgPath } from '@/utils/pathShape'
+import { scaleLocalPath, translateSvgPath, circleBoundsFromDrag, buildSemicirclePathPage, type ArcSign } from '@/utils/pathShape'
 import {
   extractAnchors,
   extractHandles,
@@ -883,11 +898,20 @@ function onPenPlaceUp() {
   }
 }
 
-const transformerConfig = {
-  rotateEnabled: true,
-  boundBoxFunc: (oldBox: any, newBox: any) =>
-      (newBox.width < 10 || newBox.height < 10) ? oldBox : newBox,
-}
+const transformerConfig = computed(() => {
+  const el = store.selectedElement
+  const keepRatio = !!(
+      store.vectorUniformScale
+      && el
+      && (el.type === 'PATH' || el.type === 'IMAGE')
+  )
+  return {
+    rotateEnabled: true,
+    keepRatio,
+    boundBoxFunc: (oldBox: any, newBox: any) =>
+        (newBox.width < 10 || newBox.height < 10) ? oldBox : newBox,
+  }
+})
 
 // ─────────────────────────────────────────────
 // 注释 Transformer 配置
@@ -1585,8 +1609,99 @@ const polylineCursor = ref<{ x: number; y: number } | null>(null)
 
 const previewLayerConfig = computed(() => ({
   listening: false,
-  visible:   isDrawing.value || polylineActive.value || penActive.value || penPlacing.value,
+  visible:   isDrawing.value
+      || polylineActive.value
+      || penActive.value
+      || penPlacing.value
+      || (store.currentTool === 'VECTOR_ARC' && !!store.lastArcSession),
 }))
+
+/** 半圆弧：Alt 反转；吸附上一弧端点时默认反向以拼圆 */
+const arcAltFlip = ref(false)
+const arcSnapStart = ref<'a' | 'b' | null>(null)
+
+function scalePathMmToPx(d: string): string {
+  return d.replace(/[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g, (num) => String(s(Number(num))))
+}
+
+function resolveArcDraw(): {
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+  sign: ArcSign
+} {
+  let x1 = drawStartX.value
+  let y1 = drawStartY.value
+  let x2 = drawCurX.value
+  let y2 = drawCurY.value
+  const session = store.lastArcSession
+  let sign: ArcSign = arcAltFlip.value ? -1 : 1
+
+  if (session && session.pageIndex === props.pageIndex && arcSnapStart.value) {
+    const other = arcSnapStart.value === 'a' ? session.b : session.a
+    const eps = Math.max(1.5, Math.hypot(session.b.x - session.a.x, session.b.y - session.a.y) * 0.05)
+    if (Math.hypot(x2 - other.x, y2 - other.y) <= eps) {
+      // 吸附到直径另一端：统一为 session.a → session.b
+      x1 = session.a.x
+      y1 = session.a.y
+      x2 = session.b.x
+      y2 = session.b.y
+      // 默认与上一弧反向（拼成圆）；按住 Alt 则同向
+      sign = (arcAltFlip.value ? session.sign : (-session.sign as ArcSign))
+    }
+  }
+  return { x1, y1, x2, y2, sign }
+}
+
+const previewArcConfig = computed(() => {
+  const { x1, y1, x2, y2, sign } = resolveArcDraw()
+  if (Math.hypot(x2 - x1, y2 - y1) < 0.5) {
+    return { data: '', visible: false }
+  }
+  return {
+    data:        scalePathMmToPx(buildSemicirclePathPage(x1, y1, x2, y2, sign)),
+    fill:        store.vectorFillEnabled ? store.vectorFillColor : 'transparent',
+    stroke:      store.vectorStrokeColor,
+    strokeWidth: store.vectorLineWidth,
+    dash:        [4, 3],
+    lineCap:     'round',
+    lineJoin:    'round',
+    visible:     true,
+    listening:   false,
+  }
+})
+
+const previewArcChordConfig = computed(() => {
+  const { x1, y1, x2, y2 } = resolveArcDraw()
+  return {
+    points:      [s(x1), s(y1), s(x2), s(y2)],
+    stroke:      '#94a3b8',
+    strokeWidth: 1,
+    dash:        [3, 3],
+    listening:   false,
+  }
+})
+
+const previewArcEndpointConfigs = computed(() => {
+  const dots: Record<string, unknown>[] = []
+  const add = (p: { x: number; y: number }, fill: string) => {
+    dots.push({
+      x: s(p.x), y: s(p.y), radius: 4,
+      fill, stroke: '#fff', strokeWidth: 1.5, listening: false,
+    })
+  }
+  if (isDrawing.value && drawTool.value === 'VECTOR_ARC') {
+    const { x1, y1, x2, y2 } = resolveArcDraw()
+    add({ x: x1, y: y1 }, '#1a73e8')
+    add({ x: x2, y: y2 }, '#1a73e8')
+  } else if (store.currentTool === 'VECTOR_ARC' && store.lastArcSession?.pageIndex === props.pageIndex) {
+    const sess = store.lastArcSession
+    add(sess.a, '#e67e22')
+    add(sess.b, '#e67e22')
+  }
+  return dots
+})
 
 const previewRectConfig = computed(() => {
   const wMm = Math.max(Math.abs(drawCurX.value - drawStartX.value), 0.5)
@@ -1735,12 +1850,24 @@ const previewPenDotConfigs = computed(() => {
 })
 
 const previewEllipseConfig = computed(() => {
-  const rx = s(Math.abs(drawCurX.value - drawStartX.value)) / 2
-  const ry = s(Math.abs(drawCurY.value - drawStartY.value)) / 2
-  const isVector = drawTool.value === 'VECTOR_ELLIPSE'
+  const isCircle = drawTool.value === 'VECTOR_CIRCLE'
+  let x0 = Math.min(drawStartX.value, drawCurX.value)
+  let y0 = Math.min(drawStartY.value, drawCurY.value)
+  let w = Math.abs(drawCurX.value - drawStartX.value)
+  let h = Math.abs(drawCurY.value - drawStartY.value)
+  if (isCircle) {
+    const b = circleBoundsFromDrag(drawStartX.value, drawStartY.value, drawCurX.value, drawCurY.value)
+    x0 = b.x
+    y0 = b.y
+    w = b.diameter
+    h = b.diameter
+  }
+  const rx = s(w) / 2
+  const ry = s(h) / 2
+  const isVector = drawTool.value === 'VECTOR_ELLIPSE' || isCircle
   return {
-    x:           s(Math.min(drawStartX.value, drawCurX.value)) + rx,
-    y:           s(Math.min(drawStartY.value, drawCurY.value)) + ry,
+    x:           s(x0) + rx,
+    y:           s(y0) + ry,
     radiusX:     rx,
     radiusY:     ry,
     fill:        isVector && store.vectorFillEnabled ? store.vectorFillColor : 'transparent',
@@ -2187,6 +2314,23 @@ function handleMouseDown(e: any) {
   drawCurX.value      = pos.x
   drawCurY.value      = pos.y
   drawingPoints.value = [s(pos.x), s(pos.y)]
+  arcAltFlip.value = false
+  arcSnapStart.value = null
+  if (store.currentTool === 'VECTOR_ARC') {
+    const session = store.lastArcSession
+    if (session && session.pageIndex === props.pageIndex) {
+      const eps = Math.max(1.5, Math.hypot(session.b.x - session.a.x, session.b.y - session.a.y) * 0.05)
+      if (Math.hypot(pos.x - session.a.x, pos.y - session.a.y) <= eps) {
+        drawStartX.value = session.a.x
+        drawStartY.value = session.a.y
+        arcSnapStart.value = 'a'
+      } else if (Math.hypot(pos.x - session.b.x, pos.y - session.b.y) <= eps) {
+        drawStartX.value = session.b.x
+        drawStartY.value = session.b.y
+        arcSnapStart.value = 'b'
+      }
+    }
+  }
   startDrawSession()
   e.evt?.preventDefault?.()
 }
@@ -2194,11 +2338,28 @@ function handleMouseDown(e: any) {
 function startDrawSession() {
   window.addEventListener('mousemove', onWindowDrawMouseMove)
   window.addEventListener('mouseup', onWindowDrawMouseUp)
+  window.addEventListener('keydown', onArcDrawKeyDown)
+  window.addEventListener('keyup', onArcDrawKeyUp)
 }
 
 function stopDrawSession() {
   window.removeEventListener('mousemove', onWindowDrawMouseMove)
   window.removeEventListener('mouseup', onWindowDrawMouseUp)
+  window.removeEventListener('keydown', onArcDrawKeyDown)
+  window.removeEventListener('keyup', onArcDrawKeyUp)
+}
+
+function onArcDrawKeyDown(e: KeyboardEvent) {
+  if (e.key === 'Alt' && drawTool.value === 'VECTOR_ARC') {
+    e.preventDefault()
+    arcAltFlip.value = true
+  }
+}
+
+function onArcDrawKeyUp(e: KeyboardEvent) {
+  if (e.key === 'Alt') {
+    arcAltFlip.value = false
+  }
 }
 
 function onWindowDrawMouseMove(e: MouseEvent) {
@@ -2271,16 +2432,24 @@ async function finishDraw() {
 
   try {
     if (tool === 'FREEHAND' && drawingPoints.value.length < 6) return
-    if (['VECTOR_LINE', 'VECTOR_RECT', 'VECTOR_ELLIPSE'].includes(tool)) {
+    if (['VECTOR_LINE', 'VECTOR_RECT', 'VECTOR_ELLIPSE', 'VECTOR_CIRCLE', 'VECTOR_ARC'].includes(tool)) {
       if (tool === 'VECTOR_LINE') {
         if (Math.hypot(endX - drawStartX.value, endY - drawStartY.value) < 1) return
+      } else if (tool === 'VECTOR_ARC') {
+        const { x1, y1, x2, y2, sign } = resolveArcDraw()
+        if (Math.hypot(x2 - x1, y2 - y1) < 1) return
+        await waitForKonvaSettle()
+        store.addVectorArc(props.pageIndex, x1, y1, x2, y2, sign)
+        arcSnapStart.value = null
+        arcAltFlip.value = false
+        return
       } else if (isDrawTooSmall(tool, width, height)) {
         return
       }
       await waitForKonvaSettle()
       store.addVectorShape(
           props.pageIndex,
-          tool as 'VECTOR_LINE' | 'VECTOR_RECT' | 'VECTOR_ELLIPSE',
+          tool as 'VECTOR_LINE' | 'VECTOR_RECT' | 'VECTOR_ELLIPSE' | 'VECTOR_CIRCLE',
           drawStartX.value,
           drawStartY.value,
           endX,
@@ -2825,8 +2994,12 @@ async function handleTransformEnd(e: any, elementId: string) {
     const scaleY = node.scaleY()
     const absSx = Math.abs(scaleX)
     const absSy = Math.abs(scaleY)
-    const newWidth = (element.width ?? 0) * absSx
-    const newHeight = (element.height ?? 0) * absSy
+    const uniform = store.vectorUniformScale
+    const sx = uniform ? absSx : absSx
+    const sy = uniform ? absSx : absSy
+    // 等比时以 scaleX 为准（Konva keepRatio 下二者应接近；取 X 避免浮点分叉）
+    const newWidth = (element.width ?? 0) * sx
+    const newHeight = (element.height ?? 0) * sy
     node.scaleX(1)
     node.scaleY(1)
     store.updateElement(props.pageIndex, elementId, {
@@ -2834,7 +3007,7 @@ async function handleTransformEnd(e: any, elementId: string) {
       y:        px2mm(node.y()),
       width:    newWidth,
       height:   newHeight,
-      pathData: scaleLocalPath(element.pathData, absSx, absSy),
+      pathData: scaleLocalPath(element.pathData, sx, sy),
       scaleX:   1,
       scaleY:   1,
       rotation: node.rotation(),

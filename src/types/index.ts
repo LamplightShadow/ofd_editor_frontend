@@ -40,6 +40,8 @@ export type ToolType =
     | 'VECTOR_LINE'  // 正文层矢量：直线
     | 'VECTOR_RECT'  // 正文层矢量：矩形
     | 'VECTOR_ELLIPSE' // 正文层矢量：椭圆
+    | 'VECTOR_CIRCLE'  // 正文层矢量：正圆
+    | 'VECTOR_ARC'     // 正文层矢量：半圆弧（可反转；第二条可拼成圆）
     | 'VECTOR_POLYLINE' // 正文层矢量：折线（点击加点，双击结束）
     | 'VECTOR_POLYGON' // 正文层矢量：多边形
     | 'VECTOR_PEN'     // 钢笔：点击落 M/L，近起点闭合，Enter/Esc 结束开放路径

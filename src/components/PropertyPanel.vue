@@ -471,6 +471,45 @@
               <el-option label="斜角" value="bevel" />
             </el-select>
           </div>
+          <div class="form-item path-style-toggles">
+            <label>变换</label>
+            <div class="toggle-row">
+              <el-checkbox
+                  :model-value="store.vectorUniformScale"
+                  @change="(v: boolean) => store.setVectorUniformScale(v)"
+              >
+                等比缩放
+              </el-checkbox>
+            </div>
+          </div>
+          <el-divider style="margin: 8px 0" />
+          <div class="form-item">
+            <label>倒圆角半径 (mm)</label>
+            <el-input-number
+                :model-value="store.pathCornerRadiusMm"
+                size="small"
+                :min="0.1"
+                :max="50"
+                :step="0.5"
+                :precision="1"
+                @change="(v: number | undefined) => v != null && store.setPathCornerRadiusMm(v)"
+            />
+          </div>
+          <div class="form-item">
+            <label>锚点倒圆</label>
+            <div class="align-btn-row">
+              <el-button
+                  size="small"
+                  :disabled="!canRoundSelectedAnchors"
+                  @click="onRoundSelectedAnchors"
+              >
+                选中锚点
+              </el-button>
+              <el-button size="small" @click="onRoundAllCorners">
+                全部折线角
+              </el-button>
+            </div>
+          </div>
           <el-divider style="margin: 8px 0" />
           <div class="form-item">
             <label>对齐到页面</label>
@@ -748,6 +787,28 @@ function updatePathStyle(changes: Partial<ElementData>) {
   if (el?.type === 'PATH') {
     store.syncVectorStyleFromElement({ ...el, ...changes })
   }
+}
+
+const canRoundSelectedAnchors = computed(() =>
+    store.isDirectSelectTool && store.selectedAnchorIndices.length > 0,
+)
+
+function onRoundSelectedAnchors() {
+  const res = store.roundSelectedPathAnchors()
+  if (!res.ok) {
+    ElMessage.warning(res.message ?? '倒圆角失败')
+    return
+  }
+  ElMessage.success('已对选中锚点倒圆角')
+}
+
+function onRoundAllCorners() {
+  const res = store.roundAllSelectedPathCorners()
+  if (!res.ok) {
+    ElMessage.warning(res.message ?? '倒圆角失败')
+    return
+  }
+  ElMessage.success('已对全部折线角倒圆')
 }
 
 function onPathFillToggle(enabled: boolean) {

@@ -19,8 +19,10 @@ import {
     estimateTextWidthMm,
 } from '@/utils/textBounds'
 import {
-    buildLineShape, buildRectShape, buildEllipseShape, buildPolylineShape, translateSvgPath,
+    buildLineShape, buildRectShape, buildEllipseShape, buildCircleShape, buildSemicircleShape,
+    buildCircleFromDiameter, buildPolylineShape, translateSvgPath,
     type PathShapeResult,
+    type ArcSign,
 } from '@/utils/pathShape'
 import { normalizeElementPathIfNeeded } from '@/utils/pathModel'
 import {
@@ -36,6 +38,9 @@ import {
     inferAnchorSmoothMode,
     cycleAnchorSmoothMode,
     buildPathFromPenKnots,
+    roundCornersAtAnchors,
+    roundAllPolylineCorners,
+    canRoundCorner,
     type PathAnchor,
     type PathHandle,
     type AnchorSmoothMode,
@@ -281,6 +286,19 @@ export const useEditorStore = defineStore('editor', () => {
     const vectorDashPattern = ref<string | undefined>(undefined)
     const vectorLineCap = ref<'butt' | 'round' | 'square'>('round')
     const vectorLineJoin = ref<'miter' | 'round' | 'bevel'>('round')
+    /** 等比缩放 PATH 时锁定宽高比 */
+    const vectorUniformScale = ref(true)
+    /** 折线锚点倒圆角半径（mm） */
+    const pathCornerRadiusMm = ref(2)
+
+    /** 最近一次半圆弧会话（供第二条弧吸附端点 / 反向拼圆） */
+    const lastArcSession = ref<{
+        pageIndex: number
+        a: { x: number; y: number }
+        b: { x: number; y: number }
+        sign: ArcSign
+        elementId: string
+    } | null>(null)
 
     /** 待放置的图章图片（data URL），选择图片后点击页面放置 */
     const pendingStampImage = ref<string | null>(null)
@@ -347,6 +365,8 @@ export const useEditorStore = defineStore('editor', () => {
         currentTool.value === 'VECTOR_LINE'
         || currentTool.value === 'VECTOR_RECT'
         || currentTool.value === 'VECTOR_ELLIPSE'
+        || currentTool.value === 'VECTOR_CIRCLE'
+        || currentTool.value === 'VECTOR_ARC'
         || currentTool.value === 'VECTOR_POLYLINE'
         || currentTool.value === 'VECTOR_POLYGON'
         || currentTool.value === 'VECTOR_PEN',
@@ -590,7 +610,7 @@ export const useEditorStore = defineStore('editor', () => {
         updateElement(currentPageIndex.value, selectedElementId.value, next)
     }
 
-    type VectorDrawTool = 'VECTOR_LINE' | 'VECTOR_RECT' | 'VECTOR_ELLIPSE'
+    type VectorDrawTool = 'VECTOR_LINE' | 'VECTOR_RECT' | 'VECTOR_ELLIPSE' | 'VECTOR_CIRCLE'
 
     /**
      * 在当前页正文层插入矢量 PathObject（拖选完成后调用）。
@@ -614,6 +634,8 @@ export const useEditorStore = defineStore('editor', () => {
             const x = Math.min(x1, x2)
             const y = Math.min(y1, y2)
             shape = buildRectShape(x, y, Math.abs(x2 - x1), Math.abs(y2 - y1))
+        } else if (tool === 'VECTOR_CIRCLE') {
+            shape = buildCircleShape(x1, y1, x2, y2)
         } else {
             const x = Math.min(x1, x2)
             const y = Math.min(y1, y2)
@@ -662,7 +684,12 @@ export const useEditorStore = defineStore('editor', () => {
         return id
     }
 
-    function pushNewPathElement(pageIndex: number, shape: PathShapeResult, fillOn: boolean): string | null {
+    function pushNewPathElement(
+        pageIndex: number,
+        shape: PathShapeResult,
+        fillOn: boolean,
+        opts?: { stayOnTool?: boolean },
+    ): string | null {
         if (!document.value) return null
         const page = document.value.pages[pageIndex]
         if (!page) return null
@@ -699,10 +726,63 @@ export const useEditorStore = defineStore('editor', () => {
         page.elements.push(element)
         selectedElementId.value = id
         selectedAnnotationId.value = null
-        currentTool.value = 'SELECT'
+        if (!opts?.stayOnTool) {
+            currentTool.value = 'SELECT'
+        }
         saveToHistory()
         schedulePageThumbnailRefresh(pageIndex, 300)
         return id
+    }
+
+    /**
+     * 半圆弧（保持弧线工具，便于接着画第二条）。
+     * 与上一弧同端点、反方向时即可拼成整圆或太极对半；不自动合并为单圆，便于双色填充。
+     */
+    function addVectorArc(
+        pageIndex: number,
+        x1: number,
+        y1: number,
+        x2: number,
+        y2: number,
+        sign: ArcSign,
+    ): string | null {
+        if (!document.value) return null
+        if (!document.value.pages[pageIndex]) return null
+        const len = Math.hypot(x2 - x1, y2 - y1)
+        if (len < 1) return null
+
+        const shape = buildSemicircleShape(x1, y1, x2, y2, sign)
+        const id = pushNewPathElement(pageIndex, shape, vectorFillEnabled.value, { stayOnTool: true })
+        if (id) {
+            lastArcSession.value = {
+                pageIndex,
+                a: { x: x1, y: y1 },
+                b: { x: x2, y: y2 },
+                sign,
+                elementId: id,
+            }
+        }
+        return id
+    }
+
+    /** 将当前半圆弧会话合成为闭合正圆（替换上一半弧） */
+    function completeLastArcAsCircle(): string | null {
+        const prev = lastArcSession.value
+        if (!prev || !document.value) return null
+        const page = document.value.pages[prev.pageIndex]
+        if (!page) return null
+        const idx = page.elements.findIndex(e => e.id === prev.elementId && !e.isDeleted)
+        if (idx >= 0) {
+            page.elements[idx] = { ...page.elements[idx], isDeleted: true, isDirty: true }
+        }
+        const shape = buildCircleFromDiameter(prev.a.x, prev.a.y, prev.b.x, prev.b.y)
+        const id = pushNewPathElement(prev.pageIndex, shape, vectorFillEnabled.value, { stayOnTool: true })
+        lastArcSession.value = null
+        return id
+    }
+
+    function clearLastArcSession() {
+        lastArcSession.value = null
     }
 
     function addVectorPolyline(
@@ -2101,7 +2181,66 @@ export const useEditorStore = defineStore('editor', () => {
         return mode
     }
 
+    function setVectorUniformScale(enabled: boolean) {
+        vectorUniformScale.value = enabled
+    }
+
+    function setPathCornerRadiusMm(radius: number) {
+        pathCornerRadiusMm.value = Math.max(0.1, Math.min(50, radius))
+    }
+
+    /** 对当前选中的折线锚点倒圆角 */
+    function roundSelectedPathAnchors(radiusMm?: number): { ok: boolean; message?: string } {
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) {
+            return { ok: false, message: '未选中路径' }
+        }
+        if (selectedAnchorIndices.value.length === 0) {
+            return { ok: false, message: '请先用直接选择工具选中锚点' }
+        }
+        if (found.pageIndex !== currentPageIndex.value) {
+            currentPageIndex.value = found.pageIndex
+        }
+        ensureSelectedPathNormalized()
+        const el2 = getSelectedPathElement()
+        if (!el2?.pathData) return { ok: false, message: '未选中路径' }
+        const r = radiusMm ?? pathCornerRadiusMm.value
+        const model = parsePathModel(el2.pathData)
+        const roundable = selectedAnchorIndices.value.filter(i => canRoundCorner(model, i))
+        if (roundable.length === 0) {
+            return { ok: false, message: '选中锚点不是可倒圆的折线角' }
+        }
+        const next = roundCornersAtAnchors(model, roundable, r)
+        const baked = rebakeLocalPath(next, el2.x, el2.y)
+        updateElement(found.pageIndex, el2.id, baked)
+        clearPathAnchorSelection()
+        return { ok: true }
+    }
+
+    /** 对路径上全部可倒圆折线角倒圆 */
+    function roundAllSelectedPathCorners(radiusMm?: number): { ok: boolean; message?: string } {
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) {
+            return { ok: false, message: '未选中路径' }
+        }
+        if (found.pageIndex !== currentPageIndex.value) {
+            currentPageIndex.value = found.pageIndex
+        }
+        ensureSelectedPathNormalized()
+        const el2 = getSelectedPathElement()
+        if (!el2?.pathData) return { ok: false, message: '未选中路径' }
+        const r = radiusMm ?? pathCornerRadiusMm.value
+        const next = roundAllPolylineCorners(parsePathModel(el2.pathData), r)
+        const baked = rebakeLocalPath(next, el2.x, el2.y)
+        updateElement(found.pageIndex, el2.id, baked)
+        clearPathAnchorSelection()
+        return { ok: true }
+    }
+
     function setTool(tool: ToolType) {
+        if (tool !== 'VECTOR_ARC') {
+            lastArcSession.value = null
+        }
         currentTool.value = tool
         selectedAnnotationId.value = null
         if (tool !== 'SELECT' && tool !== 'DIRECT_SELECT') {
@@ -2565,6 +2704,7 @@ export const useEditorStore = defineStore('editor', () => {
         typewriterFontSizeMm, typewriterColor, typewriterFontFamily, typewriterBold, typewriterItalic,
         vectorStrokeColor, vectorFillColor, vectorLineWidth, vectorFillEnabled, vectorStrokeEnabled,
         vectorDashPattern, vectorLineCap, vectorLineJoin,
+        vectorUniformScale, pathCornerRadiusMm, lastArcSession,
         pendingStampImage, hasPendingStamp,
         pageThumbnails, thumbnailLoadingPages, thumbnailLoadedCount, isGeneratingThumbnails,
         // ── 原有计算属性 ──
@@ -2587,12 +2727,15 @@ export const useEditorStore = defineStore('editor', () => {
         addTypewriterText, setTypewriterFontSizeMm, setTypewriterColor,
         setTypewriterFontFamily, setTypewriterBold, setTypewriterItalic, syncTypewriterStyleFromElement,
         applyTypewriterStyleToSelectedText,
-        addVectorShape, addVectorPolyline, addVectorFromPenKnots, setVectorStrokeColor, setVectorFillColor, setVectorLineWidth,
+        addVectorShape, addVectorPolyline, addVectorFromPenKnots, addVectorArc, completeLastArcAsCircle, clearLastArcSession,
+        setVectorStrokeColor, setVectorFillColor, setVectorLineWidth,
         setVectorFillEnabled, setVectorStrokeEnabled, setVectorDashPattern, setVectorLineCap, setVectorLineJoin,
-        applyVectorStyleToSelectedPath, applySaveElementSync,
+        setVectorUniformScale, setPathCornerRadiusMm,
+        applyVectorStyleToSelectedPath, syncVectorStyleFromElement, applySaveElementSync,
         selectedAnchorIndices, clearPathAnchorSelection, setSelectedAnchors, togglePathAnchor,
         getPathAnchors, translateSelectedPathAnchors, insertPathAnchorAtLocalPoint, deleteSelectedPathAnchors,
         getPathHandles, movePathHandle, cycleSelectedAnchorSmoothMode,
+        roundSelectedPathAnchors, roundAllSelectedPathCorners,
         alignSelectedElementToPage,
         importImageToPage, applyImageCrop,
         canCropSelectedImage, openImageCropDialog,

@@ -402,6 +402,33 @@
             <template #icon><span class="shape-icon oval">○</span></template>
           </RibbonButton>
           <RibbonButton
+              label="正圆"
+              :disabled="!store.document"
+              :active="store.currentTool === 'VECTOR_CIRCLE'"
+              tooltip="在正文层绘制正圆（拖拽时锁定宽高相等）"
+              @click="store.setTool('VECTOR_CIRCLE')"
+          >
+            <template #icon><span class="shape-icon circle">●</span></template>
+          </RibbonButton>
+          <RibbonButton
+              label="弧线"
+              :disabled="!store.document"
+              :active="store.currentTool === 'VECTOR_ARC'"
+              tooltip="拖出半圆弧（两端点）；Alt 反转弧向；从橙点拖到另一端可反向拼成圆；可继续画半弧做太极"
+              @click="store.setTool('VECTOR_ARC')"
+          >
+            <template #icon><span class="shape-icon arc">◠</span></template>
+          </RibbonButton>
+          <RibbonButton
+              v-if="store.currentTool === 'VECTOR_ARC' && store.lastArcSession"
+              label="合成圆"
+              :disabled="!store.document"
+              tooltip="将当前半圆弧合成为闭合正圆"
+              @click="store.completeLastArcAsCircle()"
+          >
+            <template #icon><span class="shape-icon circle">◎</span></template>
+          </RibbonButton>
+          <RibbonButton
               label="折线"
               :disabled="!store.document"
               :active="store.currentTool === 'VECTOR_POLYLINE'"
@@ -1830,7 +1857,9 @@ async function handleDeletePage() {
 .mark-icon.squiggly { color: var(--ribbon-accent); text-decoration: underline wavy; }
 .mark-icon.strike { color: #e74c3c; text-decoration: line-through; }
 .mark-icon.replace { color: #2980b9; text-decoration: line-through; font-style: italic; }
-.shape-icon.oval { font-size: 18px; color: var(--text-2); }
+.shape-icon.oval,
+.shape-icon.circle,
+.shape-icon.arc { font-size: 18px; color: var(--text-2); }
 
 .ribbon-placeholder {
   display: flex;

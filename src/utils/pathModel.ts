@@ -807,3 +807,183 @@ export function mirrorHandle(anchor: PathPoint, handle: PathPoint): PathPoint {
     y: 2 * anchor.y - handle.y,
   }
 }
+
+// ─── 折线角点倒圆角 ─────────────────────────────────────────
+
+function almostEqualPt(a: PathPoint, b: PathPoint, eps = 1e-6): boolean {
+  return Math.hypot(a.x - b.x, a.y - b.y) < eps
+}
+
+/**
+ * 折线角两侧是否可倒圆。
+ * - 开放路径：端点不可
+ * - 闭合路径：起点（M）与「仅 Z 闭合」的末点可倒
+ */
+export function canRoundCorner(model: PathModel, anchorIndex: number): boolean {
+  const anchors = extractAnchors(model)
+  const n = anchors.length
+  if (n < 3 || anchorIndex < 0 || anchorIndex >= n) return false
+  const closed = isPathClosed(model)
+  if (!closed && (anchorIndex === 0 || anchorIndex === n - 1)) return false
+
+  const cur = anchors[anchorIndex]
+  const next = anchors[(anchorIndex + 1) % n]
+  let prev = anchors[(anchorIndex - 1 + n) % n]
+  // 显式闭合末点与起点重合时，几何前驱取倒数第二点
+  if (closed && anchorIndex === 0 && almostEqualPt(prev.point, cur.point) && n >= 4) {
+    prev = anchors[n - 2]
+  }
+
+  const cmdCur = model.commands[cur.commandIndex]
+  const cmdNext = model.commands[next.commandIndex]
+  const cmdPrev = model.commands[prev.commandIndex]
+
+  if (cmdCur.type !== 'M' && cmdCur.type !== 'L') return false
+
+  const isClosedStart = closed && anchorIndex === 0 && cmdCur.type === 'M'
+  const isClosedEndViaZ =
+      closed && anchorIndex === n - 1 && cmdCur.type === 'L' && cmdNext.type === 'M'
+
+  if (isClosedStart) {
+    if (cmdPrev.type !== 'L') return false
+    if (cmdNext.type !== 'L') return false
+  } else if (isClosedEndViaZ) {
+    // 入边为直线即可
+  } else {
+    if (cmdCur.type === 'M') return false
+    if (cmdNext.type !== 'L') return false
+  }
+
+  const p0 = prev.point
+  const p1 = cur.point
+  const p2 = next.point
+  if (almostEqualPt(p0, p1) || almostEqualPt(p1, p2)) return false
+  const len1 = Math.hypot(p0.x - p1.x, p0.y - p1.y)
+  const len2 = Math.hypot(p2.x - p1.x, p2.y - p1.y)
+  if (len1 < 1e-6 || len2 < 1e-6) return false
+  const u1x = (p0.x - p1.x) / len1
+  const u1y = (p0.y - p1.y) / len1
+  const u2x = (p2.x - p1.x) / len2
+  const u2y = (p2.y - p1.y) / len2
+  const cos = Math.max(-1, Math.min(1, u1x * u2x + u1y * u2y))
+  const angle = Math.acos(cos)
+  return angle > 0.05 && Math.PI - angle > 0.05
+}
+
+/**
+ * 在指定折线锚点倒圆角：裁切两侧直线，插入三次贝塞尔近似圆弧。
+ * @param radiusMm 目标半径（过大时按边长自动钳制）
+ */
+export function roundCornerAtAnchor(
+    model: PathModel,
+    anchorIndex: number,
+    radiusMm: number,
+): PathModel | null {
+  if (!(radiusMm > 0) || !canRoundCorner(model, anchorIndex)) return null
+
+  const anchors = extractAnchors(model)
+  const n = anchors.length
+  const closed = isPathClosed(model)
+  const cur = anchors[anchorIndex]
+  const next = anchors[(anchorIndex + 1) % n]
+  let prev = anchors[(anchorIndex - 1 + n) % n]
+  let closeDup = anchors[(anchorIndex - 1 + n) % n]
+  if (closed && anchorIndex === 0 && almostEqualPt(prev.point, cur.point) && n >= 4) {
+    prev = anchors[n - 2]
+    // closeDup 仍为末点（与起点重合的显式闭合顶点）
+  }
+
+  const p0 = prev.point
+  const p1 = cur.point
+  const p2 = next.point
+  const len1 = Math.hypot(p0.x - p1.x, p0.y - p1.y)
+  const len2 = Math.hypot(p2.x - p1.x, p2.y - p1.y)
+  const u1 = { x: (p0.x - p1.x) / len1, y: (p0.y - p1.y) / len1 }
+  const u2 = { x: (p2.x - p1.x) / len2, y: (p2.y - p1.y) / len2 }
+  const cos = Math.max(-1, Math.min(1, u1.x * u2.x + u1.y * u2.y))
+  const angle = Math.acos(cos)
+
+  let dist = radiusMm / Math.tan(angle / 2)
+  const maxDist = Math.min(len1, len2) * 0.45
+  if (dist > maxDist) dist = maxDist
+  const rEff = dist * Math.tan(angle / 2)
+
+  const t1 = { x: p1.x + u1.x * dist, y: p1.y + u1.y * dist }
+  const t2 = { x: p1.x + u2.x * dist, y: p1.y + u2.y * dist }
+
+  const sweep = Math.PI - angle
+  const handle = (4 / 3) * Math.tan(sweep / 4) * rEff
+  const travelIn = { x: -u1.x, y: -u1.y }
+  const travelOut = { x: u2.x, y: u2.y }
+  const cp1 = { x: t1.x + travelIn.x * handle, y: t1.y + travelIn.y * handle }
+  const cp2 = { x: t2.x - travelOut.x * handle, y: t2.y - travelOut.y * handle }
+
+  const commands = clonePathCommands(model)
+  const zIdx = commands.findIndex(c => c.type === 'Z')
+
+  // 闭合路径倒圆起点：M→t2；闭合边裁到 t1 后接圆弧到 t2
+  if (closed && anchorIndex === 0 && commands[cur.commandIndex].type === 'M') {
+    const mCi = cur.commandIndex
+    commands[mCi] = { type: 'M', point: t2 }
+    if (almostEqualPt(closeDup.point, p1)) {
+      // M A … L A Z：改末点为 t1，其后插入 C→t2
+      if (commands[closeDup.commandIndex].type !== 'L') return null
+      commands[closeDup.commandIndex] = { type: 'L', point: t1 }
+      commands.splice(closeDup.commandIndex + 1, 0, { type: 'C', cp1, cp2, end: t2 })
+    } else {
+      // M A … L C Z：在 Z 前插入 L t1 + C→t2
+      if (zIdx < 0) return null
+      commands.splice(zIdx, 0, { type: 'L', point: t1 }, { type: 'C', cp1, cp2, end: t2 })
+    }
+    return { commands }
+  }
+
+  // 仅 Z 闭合时倒圆末点：L→t1，Z 前插入 C→t2
+  if (
+      closed
+      && anchorIndex === n - 1
+      && commands[cur.commandIndex].type === 'L'
+      && commands[next.commandIndex].type === 'M'
+  ) {
+    const bi = cur.commandIndex
+    commands[bi] = { type: 'L', point: t1 }
+    if (zIdx < 0) return null
+    commands.splice(zIdx, 0, { type: 'C', cp1, cp2, end: t2 })
+    return { commands }
+  }
+
+  const bi = cur.commandIndex
+  if (commands[bi].type !== 'L') return null
+  commands[bi] = { type: 'L', point: t1 }
+  commands.splice(bi + 1, 0, { type: 'C', cp1, cp2, end: t2 })
+  return { commands }
+}
+
+/** 按锚点序号从大到小倒圆，避免下标错乱 */
+export function roundCornersAtAnchors(
+    model: PathModel,
+    indices: number[],
+    radiusMm: number,
+): PathModel {
+  let m = model
+  const sorted = [...new Set(indices)].sort((a, b) => b - a)
+  for (const i of sorted) {
+    const next = roundCornerAtAnchor(m, i, radiusMm)
+    if (next) m = next
+  }
+  return m
+}
+
+export function findRoundableAnchorIndices(model: PathModel): number[] {
+  const anchors = extractAnchors(model)
+  const out: number[] = []
+  for (let i = 0; i < anchors.length; i++) {
+    if (canRoundCorner(model, i)) out.push(i)
+  }
+  return out
+}
+
+/** 对路径上所有可倒圆折线角一次性处理 */
+export function roundAllPolylineCorners(model: PathModel, radiusMm: number): PathModel {
+  return roundCornersAtAnchors(model, findRoundableAnchorIndices(model), radiusMm)
+}
