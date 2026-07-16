@@ -3342,7 +3342,14 @@ function getTextConfig(element: ElementData) {
 
   if (paragraphStyle && typeof element.letterSpacingMm === 'number') {
     letterSpacing = element.letterSpacingMm * MM_TO_PX * renderScale.value
-  } else if (isCurrencyAmount && !isVertical && !isPasswordGrid && !hasNl) {
+  } else if (isPasswordGrid) {
+    // 密码区 DeltaX 等宽（如 2.5mm）：Courier 字宽约 0.6em，用 letterSpacing 对齐列
+    const advMm = typeof element.glyphAdvanceMm === 'number' && element.glyphAdvanceMm > 0
+        ? element.glyphAdvanceMm
+        : 2.5
+    const monoCharMm = fsMm * 0.6
+    letterSpacing = (advMm - monoCharMm) * MM_TO_PX * renderScale.value
+  } else if (isCurrencyAmount && !isVertical && !hasNl) {
     const fsMmR = fsPx / (MM_TO_PX * renderScale.value)
     const ofdAdv = element.glyphAdvanceMm
     if (typeof ofdAdv === 'number' && ofdAdv > 0) {
@@ -3359,7 +3366,9 @@ function getTextConfig(element: ElementData) {
 
   const lineCount = hasNl ? content.split('\n').length : 1
   let lineHeight = hasNl ? (isVertical ? 1.05 : 1.12) : 1.15
-  if (paragraphStyle && typeof element.lineSpacingMm === 'number' && element.lineSpacingMm > 0 && fsMm > 0) {
+  if (isPasswordGrid && typeof element.lineSpacingMm === 'number' && element.lineSpacingMm > 0 && fsMm > 0) {
+    lineHeight = lineHeightRatio(fsMm, element.lineSpacingMm)
+  } else if (paragraphStyle && typeof element.lineSpacingMm === 'number' && element.lineSpacingMm > 0 && fsMm > 0) {
     lineHeight = lineHeightRatio(fsMm, element.lineSpacingMm)
   } else if (isPasswordGrid && lineCount > 1 && hMm > 0 && fsMm > 0) {
     /** 密码区：按外接框高度均分行距，避免底部溢出 */
@@ -3390,9 +3399,9 @@ function getTextConfig(element: ElementData) {
     stroke:         isSelected ? '#1a73e8' : undefined,
     strokeWidth:    isSelected ? 0.5 : 0,
   }
-  /** 竖排/密码区绑外接框；居中/右对齐需要 width；左对齐不绑 width，避免末字被裁切 */
+  /** 竖排绑外接框；密码区只绑高度（不绑 width，避免末字 / 被裁切） */
   if (isVertical && wPx > 0) return { ...baseCfg, width: wPx }
-  if (isPasswordGrid && wPx > 0 && hPx > 0) return { ...baseCfg, width: wPx, height: hPx }
+  if (isPasswordGrid && hPx > 0) return { ...baseCfg, height: hPx }
   if (paragraphStyle && wPx > 0 && (textAlign === 'center' || textAlign === 'right')) {
     return { ...baseCfg, width: wPx }
   }
