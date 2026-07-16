@@ -10,6 +10,8 @@ export interface TextLayoutMeta {
     hMm: number
     fontSizeMm?: number
     glyphAdvanceMm?: number
+    /** OFD DeltaX 展开后的逐字间距（mm），与画布 glyph run 一致 */
+    glyphAdvancesMm?: number[]
     verticalLayout?: boolean
     passwordGrid?: boolean
     fontSizeOverridden?: boolean
@@ -91,25 +93,14 @@ function resolveLetterSpacingMm(meta: TextLayoutMeta, fsMm: number): number {
     const content = meta.str
     const trimmed = content.trim()
     const hasNl = content.includes('\n')
-    const wMm = meta.wMm
     const isVertical = meta.verticalLayout === true
     const isPasswordGrid = meta.passwordGrid === true
-    const isMultiLineHorizontal = !isVertical && hasNl && wMm > 0 && !isPasswordGrid
 
     const isCurrencyAmount = /^[¥￥][\d.,]+$/.test(trimmed)
         || (/[¥￥][\d.,]+$/.test(trimmed) && trimmed.length <= 24)
-    const isNumericOrAmount = /^[\d¥￥.,/%\-+\s()（）：:]*$/.test(trimmed)
-    const isStretchLabel = !isVertical && !isPasswordGrid && !hasNl && !isMultiLineHorizontal && wMm > 0
-        && content.length > 1 && content.length <= 8 && !isNumericOrAmount && !isCurrencyAmount
-        && !content.includes('：') && !content.includes(':')
 
-    if (isStretchLabel) {
-        const naturalMm = estimateNaturalWidthMm(content, fsMm)
-        const gapMm = wMm - naturalMm
-        if (gapMm > 0.05 && gapMm < wMm * 0.35) {
-            return Math.min(gapMm / (content.length - 1), fsMm * 0.6)
-        }
-    } else if (isCurrencyAmount && !isVertical && !isPasswordGrid && !hasNl) {
+    // 与画布一致：不再短标签拉伸到 Boundary（会裁掉末字如全角 ））
+    if (isCurrencyAmount && !isVertical && !isPasswordGrid && !hasNl) {
         if (typeof meta.glyphAdvanceMm === 'number' && meta.glyphAdvanceMm > 0) {
             const lsMm = meta.glyphAdvanceMm - fsMm * 0.32
             if (lsMm > 0.02) return lsMm
@@ -189,6 +180,24 @@ export function layoutCharacterBoxes(meta: TextLayoutMeta): CharBoxMm[] {
                 ...layoutHorizontalLine(parts.tail, tailX, meta.yMm, fsMm, 0, hHighlight),
             ]
         }
+    }
+
+    // 与 CanvasEditor glyph run 一致：按 DeltaX 逐字定位
+    const advList = meta.glyphAdvancesMm
+    if (!hasNl && !isVertical && !isPasswordGrid
+        && Array.isArray(advList) && content.length > 1
+        && advList.length >= content.length - 1) {
+        const boxes: CharBoxMm[] = []
+        let x = meta.xMm
+        for (let i = 0; i < content.length; i++) {
+            const ch = content[i]
+            const step = i < content.length - 1 && typeof advList[i] === 'number' && Number.isFinite(advList[i])
+                ? advList[i]
+                : approxAdvanceEm(ch) * fsMm
+            boxes.push({ char: ch, xMm: x, yMm: meta.yMm, wMm: Math.max(step, fsMm * 0.2), hMm: hHighlight })
+            x += step
+        }
+        return boxes
     }
 
     if (isVertical || isPasswordGrid) {

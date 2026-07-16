@@ -115,6 +115,18 @@ export const useEditorStore = defineStore('editor', () => {
     const searching = ref(false)
     /** 文本选择模式：开启后画布上叠加可选中文本层（关闭批注/元素交互） */
     const textSelectMode = ref(false)
+    /** 编辑器参考网格（仅显示，不写入 OFD） */
+    const showReferenceGrid = ref(false)
+    /** 网格间距（mm） */
+    const referenceGridSpacingMm = ref(5)
+
+    function setShowReferenceGrid(on: boolean) {
+        showReferenceGrid.value = on
+    }
+
+    function toggleReferenceGrid(on?: boolean) {
+        showReferenceGrid.value = on ?? !showReferenceGrid.value
+    }
 
     /** 全局文本水印（保存/导出时烘焙） */
     const watermarkConfig = ref<WatermarkConfig | null>(null)
@@ -158,6 +170,7 @@ export const useEditorStore = defineStore('editor', () => {
                         hMm: el.height,
                         fontSizeMm: el.fontSize,
                         glyphAdvanceMm: el.glyphAdvanceMm,
+                        glyphAdvancesMm: el.glyphAdvancesMm,
                         verticalLayout: el.verticalLayout,
                         passwordGrid: el.passwordGrid,
                         fontSizeOverridden: el.fontSizeOverridden,
@@ -2692,9 +2705,9 @@ export const useEditorStore = defineStore('editor', () => {
         setOutlines, setLeftPanelTab, showOutlinePanel, navigateOutline,
         // ── 搜索 / 文本选择 ──
         searchVisible, searchQuery, searchMatches, searchActiveIndex, searching,
-        textSelectMode, searchMatchesByPage,
+        textSelectMode, showReferenceGrid, referenceGridSpacingMm, searchMatchesByPage,
         openSearch, closeSearch, runSearch, nextMatch, prevMatch, jumpToMatch,
-        toggleTextSelectMode, getPageTextItems,
+        toggleTextSelectMode, setShowReferenceGrid, toggleReferenceGrid, getPageTextItems,
         // ── 注释状态 ──
         currentTool, annotationsMap, annotationRepliesMap, discussionAuthor, selectedAnnotationId,
         rightPanelTab, annotationListScope, setAnnotationListScope,

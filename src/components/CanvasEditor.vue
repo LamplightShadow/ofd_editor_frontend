@@ -44,6 +44,19 @@
             <v-text :config="getCurrencyHeadConfig(element)" />
             <v-text :config="getCurrencyTailConfig(element)" />
           </v-group>
+          <v-group
+              v-else-if="element.type === 'TEXT' && usesGlyphAdvances(element)"
+              :config="getGlyphRunGroupConfig(element)"
+              @click="handleElementClick($event, element.id)"
+              @dragend="(e: any) => handleDragEnd(e, element.id)"
+              @transformend="(e: any) => handleTransformEnd(e, element.id)"
+          >
+            <v-text
+                v-for="(cfg, gi) in getGlyphRunCharConfigs(element)"
+                :key="element.id + '-g-' + gi"
+                :config="cfg"
+            />
+          </v-group>
           <v-text
               v-else-if="element.type === 'TEXT'"
               :config="getTextConfig(element)"
@@ -93,6 +106,15 @@
               v-else
               :config="getFallbackConfig(element)"
               @click="handleElementClick($event, element.id)"
+          />
+        </template>
+
+        <!-- 参考网格：仅编辑器显示，不写入 OFD；listening=false 不挡操作 -->
+        <template v-if="!offscreen && store.showReferenceGrid">
+          <v-line
+              v-for="(line, i) in referenceGridLineConfigs"
+              :key="'grid-' + i"
+              :config="line"
           />
         </template>
 
@@ -415,6 +437,8 @@ import {
 } from '@/utils/pathModel'
 import { dashPatternToKonva, normalizeLineCap, normalizeLineJoin } from '@/utils/pathStyle'
 import { lineHeightRatio, normalizeTextAlign } from '@/utils/textLayout'
+import { buildOfdFontStack } from '@/utils/ofdFont'
+import { usesGlyphAdvances, glyphCharOffsetMm } from '@/utils/ofdGlyphText'
 import LinkActionDialog from '@/components/LinkActionDialog.vue'
 import type { LinkActionType } from '@/types'
 
@@ -550,6 +574,9 @@ watch(
                 grp?.setAttrs(getCurrencyGroupConfig(el))
                 stage.findOne('#' + el.id + '-cur-h')?.setAttrs(getCurrencyHeadConfig(el))
                 stage.findOne('#' + el.id + '-cur-t')?.setAttrs(getCurrencyTailConfig(el))
+              } else if (usesGlyphAdvances(el)) {
+                const grp = stage.findOne('#' + el.id)
+                grp?.setAttrs(getGlyphRunGroupConfig(el))
               } else {
                 node.setAttrs(getTextConfig(el))
               }
@@ -623,6 +650,38 @@ const bgConfig = computed(() => ({
   fill:   'white',
   name:   'page-bg',
 }))
+
+/** 编辑器参考网格（mm 间距 → 屏幕线），不参与保存 */
+const referenceGridLineConfigs = computed(() => {
+  const spacingMm = Math.max(1, store.referenceGridSpacingMm || 5)
+  const wMm = props.page.width
+  const hMm = props.page.height
+  const lines: Record<string, unknown>[] = []
+  const majorEvery = 5
+  let col = 0
+  for (let xMm = 0; xMm <= wMm + 1e-6; xMm += spacingMm, col++) {
+    const major = col % majorEvery === 0
+    lines.push({
+      points: [s(xMm), 0, s(xMm), canvasHeight.value],
+      stroke: major ? 'rgba(70, 120, 200, 0.28)' : 'rgba(70, 120, 200, 0.12)',
+      strokeWidth: major ? 1 : 0.5,
+      listening: false,
+      name: 'reference-grid',
+    })
+  }
+  let row = 0
+  for (let yMm = 0; yMm <= hMm + 1e-6; yMm += spacingMm, row++) {
+    const major = row % majorEvery === 0
+    lines.push({
+      points: [0, s(yMm), canvasWidth.value, s(yMm)],
+      stroke: major ? 'rgba(70, 120, 200, 0.28)' : 'rgba(70, 120, 200, 0.12)',
+      strokeWidth: major ? 1 : 0.5,
+      listening: false,
+      name: 'reference-grid',
+    })
+  }
+  return lines
+})
 
 // ─────────────────────────────────────────────
 // 原生 PDF 背景（PDF.js）
@@ -2990,18 +3049,21 @@ async function handleTransformEnd(e: any, elementId: string) {
       rotation: node.rotation(),
     })
   } else if (element?.type === 'PATH' && element.pathLocalCoords && element.pathData) {
-    const scaleX = node.scaleX()
-    const scaleY = node.scaleY()
-    const absSx = Math.abs(scaleX)
-    const absSy = Math.abs(scaleY)
+    // getPathConfig 用 scaleX/Y = MM_TO_PX*zoom 把「mm 路径」画到屏幕；
+    // Transformer 改的是节点总 scale，必须先除掉显示系数，只把用户缩放写入 path。
+    const sc = MM_TO_PX * renderScale.value
+    const rawSx = node.scaleX()
+    const rawSy = node.scaleY()
+    const absSx = sc > 1e-9 ? Math.abs(rawSx) / sc : Math.abs(rawSx)
+    const absSy = sc > 1e-9 ? Math.abs(rawSy) / sc : Math.abs(rawSy)
     const uniform = store.vectorUniformScale
     const sx = uniform ? absSx : absSx
     const sy = uniform ? absSx : absSy
-    // 等比时以 scaleX 为准（Konva keepRatio 下二者应接近；取 X 避免浮点分叉）
     const newWidth = (element.width ?? 0) * sx
     const newHeight = (element.height ?? 0) * sy
-    node.scaleX(1)
-    node.scaleY(1)
+    // 先回到显示用 scale，避免写回前一帧用 scale=1 画出「毫米当像素」的巨形
+    node.scaleX(sc)
+    node.scaleY(sc)
     store.updateElement(props.pageIndex, elementId, {
       x:        px2mm(node.x()),
       y:        px2mm(node.y()),
@@ -3100,6 +3162,57 @@ function isCurrencySplitText(element: ElementData): boolean {
   return /[¥￥][\d.,]+$/.test(t) && t.length <= 24
 }
 
+function textCtmScaleX(element: ElementData): number {
+  const sx = element.textScaleX
+  return typeof sx === 'number' && sx > 0.05 && Number.isFinite(sx) ? sx : 1
+}
+
+function getGlyphRunGroupConfig(element: ElementData) {
+  const isSelected = store.selectedElementId === element.id
+  return {
+    id:        element.id,
+    x:         s(element.x),
+    y:         s(element.y),
+    scaleX:    textCtmScaleX(element),
+    scaleY:    1,
+    rotation:  element.rotation ?? 0,
+    draggable: elementDraggable(),
+    listening: elementListens(),
+    stroke:    isSelected ? '#1a73e8' : undefined,
+    strokeWidth: isSelected ? 0.5 : 0,
+  }
+}
+
+function getGlyphRunCharConfigs(element: ElementData) {
+  const content = element.content ?? ''
+  const advances = element.glyphAdvancesMm ?? []
+  const fsMm = element.fontSize ?? 4.233
+  let fsPx = fsMm * MM_TO_PX * renderScale.value
+  const wPx = s(element.width ?? 0)
+  if (element.fontSizeOverridden !== true && wPx > 0) {
+    // 不按外接框压字号；逐字排版以 Size/DeltaX 为准
+  }
+  const fontStack = buildOfdFontStack(element.fontFamily)
+  const fill = element.color ?? '#000000'
+  const configs: Record<string, unknown>[] = []
+  for (let i = 0; i < content.length; i++) {
+    const oxMm = glyphCharOffsetMm(advances, i, content, fsMm)
+    configs.push({
+      x:          s(oxMm),
+      y:          0,
+      text:       content[i],
+      fontSize:   fsPx,
+      fontFamily: fontStack,
+      fontStyle:  `${element.bold ? 'bold' : 'normal'} ${element.italic ? 'italic' : ''}`.trim(),
+      fill,
+      letterSpacing: 0,
+      wrap:       'none',
+      listening:  false,
+    })
+  }
+  return configs
+}
+
 function getCurrencySplitParts(content: string): { prefix: string; symbol: string; tail: string } | null {
   const t = normalizeCurrencyContent(content)
   const m = t.match(/^(.*?)([¥￥])([\d.,]+)$/)
@@ -3118,12 +3231,9 @@ function currencyTailOffsetPx(prefix: string, fsMm: number, glyphAdvanceMm?: num
 }
 
 function buildTextFontStyle(element: ElementData, fsPx: number) {
-  const fontStack = [element.fontFamily, 'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', 'sans-serif']
-      .filter((x): x is string => typeof x === 'string' && x.length > 0)
-      .join(', ')
   return {
     fontSize:   fsPx,
-    fontFamily: fontStack,
+    fontFamily: buildOfdFontStack(element.fontFamily),
     fontStyle:  `${element.bold ? 'bold' : 'normal'} ${element.italic ? 'italic' : ''}`.trim(),
     fill:       element.color ?? '#000000',
     wrap:       'none' as const,
@@ -3152,6 +3262,8 @@ function getCurrencyGroupConfig(element: ElementData) {
     id:        element.id,
     x:         s(element.x),
     y:         s(element.y),
+    scaleX:    textCtmScaleX(element),
+    scaleY:    1,
     rotation:  element.rotation ?? 0,
     draggable: elementDraggable(),
     listening: elementListens(),
@@ -3210,7 +3322,6 @@ function getTextConfig(element: ElementData) {
   // 后端竖排：content 已按字符拆为多行；用列宽做字号上限，避免被外接框高度撑爆
   const isVertical = element.verticalLayout === true || (hasNl && wMm > 0 && hMm > 0 && hMm > wMm * 1.5)
   const isPasswordGrid = element.passwordGrid === true
-  const isMultiLineHorizontal = !isVertical && hasNl && wPx > 0 && !isPasswordGrid
   const paragraphStyle = !isVertical && !isPasswordGrid
   const textAlign = paragraphStyle ? normalizeTextAlign(element.textAlign) : (isVertical ? 'center' : 'left')
 
@@ -3222,27 +3333,15 @@ function getTextConfig(element: ElementData) {
     if (wPx > 0) fsPx = Math.min(fsPx, wPx * 0.92)
   }
 
-  // 字距：用户显式设置 letterSpacingMm 时优先；否则保留金额/标签拉伸逻辑
+  // 字距：有逐字 DeltaX 时走 glyph run；否则用户/段落 letterSpacing；金额单独处理。
+  // 不再做「短标签拉伸到 Boundary」——发票标签会被拉超 Boundary，末字（如 ））被 width 裁掉。
   let letterSpacing = 0
   const trimmed = content.trim()
   const isCurrencyAmount = /^[¥￥][\d.,]+$/.test(trimmed)
       || (/[¥￥][\d.,]+$/.test(trimmed) && trimmed.length <= 24)
-  const isNumericOrAmount = /^[\d¥￥.,/%\-+\s()（）：:]*$/.test(trimmed)
-  const isStretchLabel = !isVertical && !isPasswordGrid && !hasNl && !isMultiLineHorizontal && wMm > 0
-      && content.length > 1 && content.length <= 8 && !isNumericOrAmount && !isCurrencyAmount
-      && !content.includes('：') && !content.includes(':')
-      && typeof element.letterSpacingMm !== 'number'
 
   if (paragraphStyle && typeof element.letterSpacingMm === 'number') {
     letterSpacing = element.letterSpacingMm * MM_TO_PX * renderScale.value
-  } else if (isStretchLabel) {
-    const fsMmRendered = fsPx / (MM_TO_PX * renderScale.value)
-    const naturalMm    = estimateNaturalWidthMm(content, fsMmRendered)
-    const gapMm        = wMm - naturalMm
-    if (gapMm > 0.05 && gapMm < wMm * 0.35) {
-      const lsMm = gapMm / (content.length - 1)
-      letterSpacing = Math.min(lsMm, fsMmRendered * 0.6) * MM_TO_PX * renderScale.value
-    }
   } else if (isCurrencyAmount && !isVertical && !isPasswordGrid && !hasNl) {
     const fsMmR = fsPx / (MM_TO_PX * renderScale.value)
     const ofdAdv = element.glyphAdvanceMm
@@ -3256,9 +3355,7 @@ function getTextConfig(element: ElementData) {
 
   const displayText = isCurrencyAmount ? formatCurrencyDisplayText(content) : content
 
-  const fontStack = [element.fontFamily, 'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', 'sans-serif']
-      .filter((x): x is string => typeof x === 'string' && x.length > 0)
-      .join(', ')
+  const fontStack = buildOfdFontStack(element.fontFamily)
 
   const lineCount = hasNl ? content.split('\n').length : 1
   let lineHeight = hasNl ? (isVertical ? 1.05 : 1.12) : 1.15
@@ -3273,6 +3370,8 @@ function getTextConfig(element: ElementData) {
     id:             element.id,
     x:              s(element.x),
     y:              s(element.y),
+    scaleX:         textCtmScaleX(element),
+    scaleY:         1,
     rotation:       element.rotation ?? 0,
     draggable:      elementDraggable(),
     listening:      elementListens(),
@@ -3291,10 +3390,12 @@ function getTextConfig(element: ElementData) {
     stroke:         isSelected ? '#1a73e8' : undefined,
     strokeWidth:    isSelected ? 0.5 : 0,
   }
-  /** 竖排/密码区绑外接框尺寸以便 verticalAlign 居中；横排对齐需 width */
+  /** 竖排/密码区绑外接框；居中/右对齐需要 width；左对齐不绑 width，避免末字被裁切 */
   if (isVertical && wPx > 0) return { ...baseCfg, width: wPx }
   if (isPasswordGrid && wPx > 0 && hPx > 0) return { ...baseCfg, width: wPx, height: hPx }
-  if (paragraphStyle && wPx > 0) return { ...baseCfg, width: wPx }
+  if (paragraphStyle && wPx > 0 && (textAlign === 'center' || textAlign === 'right')) {
+    return { ...baseCfg, width: wPx }
+  }
   return baseCfg
 }
 
@@ -3769,8 +3870,11 @@ async function captureForPrint(
   const stage:   any = stageRef.value?.getNode?.()
   const annLayer: any = annotationLayerRef.value?.getNode?.()
   const prevAnnVisible = annLayer?.visible?.() ?? true
+  const gridNodes: any[] = stage?.find?.('.reference-grid') ?? []
+  const prevGridVisible = gridNodes.map((n: any) => n.visible?.() ?? true)
 
   if (annLayer && !includeAnnotations) annLayer.visible(false)
+  for (const n of gridNodes) n.visible?.(false)
   stage?.draw?.()
 
   let dataUrl = ''
@@ -3783,8 +3887,9 @@ async function captureForPrint(
 
   if (annLayer && !includeAnnotations) {
     annLayer.visible(prevAnnVisible)
-    stage?.draw?.()
   }
+  gridNodes.forEach((n: any, i: number) => n.visible?.(prevGridVisible[i]))
+  stage?.draw?.()
 
   const rotation = props.offscreen
       ? normalizeViewRotation(props.page.pageRotate ?? 0)

@@ -56,7 +56,10 @@
             <p class="welcome-desc">专业的开放版式文档（OFD）编辑器<br/>解析 · 编辑 · 批注 · 与 PDF 双向转换</p>
 
             <div class="welcome-actions">
-              <el-button type="primary" size="large" :icon="Upload" @click="triggerUpload">
+              <el-button type="primary" size="large" :icon="Document" @click="createBlankVisible = true">
+                新建空白 OFD
+              </el-button>
+              <el-button size="large" :icon="Upload" @click="triggerUpload">
                 打开 OFD 文件
               </el-button>
               <el-button size="large" :icon="Upload" @click="triggerPdf">
@@ -94,6 +97,10 @@
             <span class="status-sep">|</span>
             <span>页旋转 {{ normalizeViewRotation(store.currentPage.pageRotate) }}°</span>
           </template>
+          <template v-if="store.showReferenceGrid">
+            <span class="status-sep">|</span>
+            <span>参考网格</span>
+          </template>
           <template v-if="store.watermarkConfig">
             <span class="status-sep">|</span>
             <span>水印：{{ store.watermarkConfig.text }}</span>
@@ -106,6 +113,9 @@
 
     <!-- 打印对话框 -->
     <PrintDialog @print="handlePrint" />
+
+    <!-- 新建空白 OFD -->
+    <CreateBlankOfdDialog v-model="createBlankVisible" />
 
     <!-- 快捷键说明 -->
     <ShortcutsDialog v-model="store.shortcutsDialogVisible" />
@@ -137,7 +147,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Upload } from '@element-plus/icons-vue'
+import { Upload, Document } from '@element-plus/icons-vue'
 import { useEditorStore } from '@/stores/editorStore'
 import { saveDocument, openPrintDialog } from '@/composables/useDocumentFileActions'
 import { registerBeforeUnloadGuard } from '@/composables/useUnsavedChangesGuard'
@@ -154,6 +164,7 @@ import RightSidePanel from '@/components/RightSidePanel.vue'
 import PrintDialog from '@/components/PrintDialog.vue'
 import ShortcutsDialog from '@/components/ShortcutsDialog.vue'
 import SearchBar from '@/components/SearchBar.vue'
+import CreateBlankOfdDialog from '@/components/CreateBlankOfdDialog.vue'
 import {
   buildPrintWindow, resolvePageIndices, qualityToPixelRatio,
   type PrintOptions, type CapturedPage,
@@ -161,6 +172,7 @@ import {
 import { normalizeViewRotation, viewStagePixelSize } from '@/utils/viewRotation'
 
 const store = useEditorStore()
+const createBlankVisible = ref(false)
 const uploadRef = ref<HTMLInputElement>()
 const pdfRef = ref<HTMLInputElement>()
 const singleCanvasRef = ref<InstanceType<typeof CanvasEditor> | null>(null)

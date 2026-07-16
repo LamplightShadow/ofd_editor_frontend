@@ -102,6 +102,7 @@ export interface PageTextItem {
     /** 可选：OFD 解析出的字号（mm） */
     fontSizeMm?: number
     glyphAdvanceMm?: number
+    glyphAdvancesMm?: number[]
     verticalLayout?: boolean
     passwordGrid?: boolean
     fontSizeOverridden?: boolean

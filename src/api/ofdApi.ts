@@ -189,6 +189,28 @@ export const ofdApi = {
     },
 
     /**
+     * 创建空白 OFD（默认 A4），返回带 fileId 的文档以便保存/批注。
+     * POST /api/ofd/create-blank
+     */
+    createBlankOfd: async (opts?: {
+        widthMm?: number
+        heightMm?: number
+        title?: string
+    }): Promise<DocumentData> => {
+        const params = new URLSearchParams()
+        if (opts?.widthMm != null) params.set('widthMm', String(opts.widthMm))
+        if (opts?.heightMm != null) params.set('heightMm', String(opts.heightMm))
+        if (opts?.title) params.set('title', opts.title)
+        const qs = params.toString()
+        const res = await http.post<DocumentData>(
+            `/create-blank${qs ? `?${qs}` : ''}`,
+            null,
+            { timeout: 60_000 },
+        )
+        return res.data
+    },
+
+    /**
      * 原生解析 PDF（不栅格化）：仅返回页面尺寸 + fileId，页面由前端 PDF.js 渲染。
      * POST /api/ofd/parse-pdf
      */

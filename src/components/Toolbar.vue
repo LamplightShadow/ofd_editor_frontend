@@ -41,6 +41,7 @@
       <!-- ===== 文件 ===== -->
       <template v-if="activeTab === 'file'">
         <RibbonGroup label="打开">
+          <RibbonButton label="新建空白" :icon="Document" tooltip="创建空白 OFD，可选参考网格（网格不写入文件）" @click="createBlankVisible = true" />
           <RibbonButton label="打开OFD" :icon="FolderOpened" @click="pickOpenOfd" />
           <RibbonButton label="导入PDF" :icon="Upload" @click="pickOpenPdf" />
           <el-dropdown trigger="click" placement="bottom-start" @command="handleRecentCommand">
@@ -284,6 +285,17 @@
               :disabled="!store.document"
               :active="store.pageViewMode === 'continuous'"
               @click="store.setPageViewMode('continuous')"
+          />
+        </RibbonGroup>
+        <RibbonSep />
+        <RibbonGroup label="参考线">
+          <RibbonButton
+              label="网格"
+              :icon="Grid"
+              :disabled="!store.document"
+              :active="store.showReferenceGrid"
+              tooltip="显示/隐藏参考网格（仅编辑器显示，不会写入 OFD）"
+              @click="store.toggleReferenceGrid()"
           />
         </RibbonGroup>
         <RibbonSep />
@@ -746,6 +758,7 @@
     <ExtractPagesDialog v-model="extractDialogVisible" />
     <DefaultStampDialog v-model="stampDialogVisible" @picked="activeTab = 'comment'" />
     <AnnotationReportDialog v-model="annotationReportVisible" />
+    <CreateBlankOfdDialog v-model="createBlankVisible" />
   </div>
 </template>
 
@@ -760,7 +773,7 @@ import {
   InfoFilled, Rank, FullScreen, View, Expand, Crop,
   Document, Reading, Sort, Picture, Files, PictureFilled, Monitor,
   Lock, Key, Stamp, Medal, QuestionFilled, Clock, Scissor,
-  Search, DocumentCopy, CircleCheck, Link as LinkIcon, Menu, Aim,
+  Search, DocumentCopy, CircleCheck, Link as LinkIcon, Menu, Aim, Grid,
 } from '@element-plus/icons-vue'
 import { useEditorStore } from '@/stores/editorStore'
 import { TYPEWRITER_FONT_OPTIONS } from '@/utils/typewriterFonts'
@@ -793,6 +806,7 @@ import ExportPdfDialog from '@/components/ExportPdfDialog.vue'
 import ExtractPagesDialog from '@/components/ExtractPagesDialog.vue'
 import DefaultStampDialog from '@/components/DefaultStampDialog.vue'
 import AnnotationReportDialog from '@/components/AnnotationReportDialog.vue'
+import CreateBlankOfdDialog from '@/components/CreateBlankOfdDialog.vue'
 
 const HandIcon = defineComponent({
   name: 'HandIcon',
@@ -827,6 +841,7 @@ const ofdToHtmlInputRef = ref<HTMLInputElement>()
 const imageInputRef = ref<HTMLInputElement>()
 const stampInputRef = ref<HTMLInputElement>()
 const docPropsVisible = ref(false)
+const createBlankVisible = ref(false)
 const mergeDialogVisible = ref(false)
 const pdfMergeDialogVisible = ref(false)
 const ofdSplitDialogVisible = ref(false)

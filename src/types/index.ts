@@ -68,6 +68,13 @@ export interface ElementData {
     passwordGrid?: boolean
     /** OFD TextCode DeltaX 平均字距（mm） */
     glyphAdvanceMm?: number
+    /**
+     * OFD TextCode DeltaX 展开后的逐字间距（mm）。
+     * 长度一般为 content.length-1；有此字段时前端按 OFD 坐标逐字绘制，避免系统字体字宽导致叠字/裁切。
+     */
+    glyphAdvancesMm?: number[]
+    /** OFD TextObject CTM 水平缩放（如 0.89）；与字号纵向缩放分开 */
+    textScaleX?: number
     /** 横排段落对齐（竖排/密码区不适用） */
     textAlign?: 'left' | 'center' | 'right'
     /** 字间距增量（mm），叠加在默认字宽上 */
