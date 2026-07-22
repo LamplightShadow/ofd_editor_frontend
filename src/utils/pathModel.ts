@@ -229,6 +229,41 @@ export function scalePathModel(model: PathModel, sx: number, sy: number): PathMo
 }
 
 /**
+ * 绕中心点 (cx, cy) 做剪切（倾斜）。
+ * x' = cx + (x-cx) + shx*(y-cy)
+ * y' = cy + (y-cy) + shy*(x-cx)
+ * 矩形 + 水平剪切 (shy=0) → 平行四边形。
+ */
+export function skewPathModel(
+    model: PathModel,
+    cx: number,
+    cy: number,
+    shx: number,
+    shy: number,
+): PathModel {
+  if (Math.abs(shx) < 1e-12 && Math.abs(shy) < 1e-12) return model
+  return mapPoints(model, (p) => {
+    const lx = p.x - cx
+    const ly = p.y - cy
+    return {
+      x: cx + lx + shx * ly,
+      y: cy + ly + shy * lx,
+    }
+  })
+}
+
+export function skewSvgPath(
+    pathData: string,
+    cx: number,
+    cy: number,
+    shx: number,
+    shy: number,
+): string {
+  if (!pathData.trim()) return pathData
+  return serializePathModel(skewPathModel(parsePathModel(pathData), cx, cy, shx, shy))
+}
+
+/**
  * 旧路径规范化：页坐标（或任意绝对坐标）path → 局部 path + Boundary。
  * 不丢弃 C 段；结果 `pathLocalCoords: true`。
  */
@@ -986,4 +1021,274 @@ export function findRoundableAnchorIndices(model: PathModel): number[] {
 /** 对路径上所有可倒圆折线角一次性处理 */
 export function roundAllPolylineCorners(model: PathModel, radiusMm: number): PathModel {
   return roundCornersAtAnchors(model, findRoundableAnchorIndices(model), radiusMm)
+}
+
+/** 相对点 (cx,cy) 缩放 */
+export function scalePathModelAbout(
+    model: PathModel,
+    cx: number,
+    cy: number,
+    sx: number,
+    sy: number,
+): PathModel {
+  if (Math.abs(sx - 1) < 1e-9 && Math.abs(sy - 1) < 1e-9) return model
+  return mapPoints(model, (p) => ({
+    x: cx + (p.x - cx) * sx,
+    y: cy + (p.y - cy) * sy,
+  }))
+}
+
+/** 绕 (cx,cy) 旋转（角度制，逆时针为正） */
+export function rotatePathModel(
+    model: PathModel,
+    cx: number,
+    cy: number,
+    angleDeg: number,
+): PathModel {
+  if (Math.abs(angleDeg) < 1e-9) return model
+  const rad = (angleDeg * Math.PI) / 180
+  const cos = Math.cos(rad)
+  const sin = Math.sin(rad)
+  return mapPoints(model, (p) => {
+    const lx = p.x - cx
+    const ly = p.y - cy
+    return {
+      x: cx + lx * cos - ly * sin,
+      y: cy + lx * sin + ly * cos,
+    }
+  })
+}
+
+/** 水平/垂直镜像（相对中心线） */
+export function mirrorPathModel(
+    model: PathModel,
+    axis: 'horizontal' | 'vertical',
+    cx: number,
+    cy: number,
+): PathModel {
+  if (axis === 'horizontal') {
+    // 上下翻转：y 关于 cy 镜像
+    return mapPoints(model, (p) => ({ x: p.x, y: cy * 2 - p.y }))
+  }
+  // 左右翻转
+  return mapPoints(model, (p) => ({ x: cx * 2 - p.x, y: p.y }))
+}
+
+/** 包围盒中心 */
+export function getPathCenter(model: PathModel): PathPoint {
+  const b = getPathBounds(model)
+  return { x: b.x + b.width / 2, y: b.y + b.height / 2 }
+}
+
+function cubicAt(p0: PathPoint, p1: PathPoint, p2: PathPoint, p3: PathPoint, t: number): PathPoint {
+  const u = 1 - t
+  const tt = t * t
+  const uu = u * u
+  return {
+    x: uu * u * p0.x + 3 * uu * t * p1.x + 3 * u * tt * p2.x + tt * t * p3.x,
+    y: uu * u * p0.y + 3 * uu * t * p1.y + 3 * u * tt * p2.y + tt * t * p3.y,
+  }
+}
+
+/**
+ * 将路径采样为折线点列（用于偏移/简化）。
+ * `stepsPerCubic`：每段 C 的采样段数。
+ */
+export function samplePathToPolyline(
+    model: PathModel,
+    stepsPerCubic = 8,
+): { points: PathPoint[]; closed: boolean } {
+  const points: PathPoint[] = []
+  let cursor: PathPoint | null = null
+  let start: PathPoint | null = null
+  const closed = isPathClosed(model)
+
+  const push = (p: PathPoint) => {
+    const last = points[points.length - 1]
+    if (last && Math.hypot(last.x - p.x, last.y - p.y) < 1e-9) return
+    points.push({ x: p.x, y: p.y })
+  }
+
+  for (const c of model.commands) {
+    if (c.type === 'M') {
+      cursor = { ...c.point }
+      start = { ...c.point }
+      push(cursor)
+    } else if (c.type === 'L') {
+      cursor = { ...c.point }
+      push(cursor)
+    } else if (c.type === 'C') {
+      if (!cursor) {
+        cursor = { ...c.cp1 }
+        start = { ...cursor }
+        push(cursor)
+      }
+      const p0 = cursor
+      for (let i = 1; i <= stepsPerCubic; i++) {
+        push(cubicAt(p0, c.cp1, c.cp2, c.end, i / stepsPerCubic))
+      }
+      cursor = { ...c.end }
+    } else if (c.type === 'Z') {
+      if (start) push(start)
+      cursor = start
+    }
+  }
+
+  if (closed && points.length > 1) {
+    const a = points[0]
+    const b = points[points.length - 1]
+    if (Math.hypot(a.x - b.x, a.y - b.y) < 1e-6) points.pop()
+  }
+
+  return { points, closed }
+}
+
+function unitNormal(from: PathPoint, to: PathPoint): PathPoint {
+  const dx = to.x - from.x
+  const dy = to.y - from.y
+  const len = Math.hypot(dx, dy) || 1
+  // 左侧法向（逆时针外侧对闭合正绕）
+  return { x: -dy / len, y: dx / len }
+}
+
+/**
+ * 折线平行偏移（顶点处取相邻边法向平均）。
+ * `distance`>0 沿左侧法向；闭合路径保持闭合。
+ */
+export function offsetPolyline(
+    points: PathPoint[],
+    distance: number,
+    closed: boolean,
+): PathPoint[] {
+  const n = points.length
+  if (n < 2 || Math.abs(distance) < 1e-12) return points.map((p) => ({ ...p }))
+
+  const out: PathPoint[] = []
+  for (let i = 0; i < n; i++) {
+    const curr = points[i]
+    if (!closed && i === 0) {
+      const nrm = unitNormal(points[0], points[1])
+      out.push({ x: curr.x + nrm.x * distance, y: curr.y + nrm.y * distance })
+      continue
+    }
+    if (!closed && i === n - 1) {
+      const nrm = unitNormal(points[n - 2], points[n - 1])
+      out.push({ x: curr.x + nrm.x * distance, y: curr.y + nrm.y * distance })
+      continue
+    }
+    const prev = points[(i - 1 + n) % n]
+    const next = points[(i + 1) % n]
+    const n0 = unitNormal(prev, curr)
+    const n1 = unitNormal(curr, next)
+    let nx = n0.x + n1.x
+    let ny = n0.y + n1.y
+    const nl = Math.hypot(nx, ny)
+    if (nl < 1e-9) {
+      nx = n1.x
+      ny = n1.y
+    } else {
+      nx /= nl
+      ny /= nl
+    }
+    // 尖角处略放大，避免缩进过多（简化 miter）
+    const dot = Math.max(-1, Math.min(1, n0.x * n1.x + n0.y * n1.y))
+    const miter = Math.min(4, 1 / Math.max(0.2, Math.sqrt((1 + dot) / 2)))
+    out.push({
+      x: curr.x + nx * distance * miter,
+      y: curr.y + ny * distance * miter,
+    })
+  }
+  return out
+}
+
+function polylineToPathModel(points: PathPoint[], closed: boolean): PathModel {
+  if (points.length === 0) return { commands: [] }
+  const commands: PathCommand[] = [{ type: 'M', point: { ...points[0] } }]
+  for (let i = 1; i < points.length; i++) {
+    commands.push({ type: 'L', point: { ...points[i] } })
+  }
+  if (closed && points.length >= 3) commands.push({ type: 'Z' })
+  return { commands }
+}
+
+/** 路径偏移：采样 → 折线偏移 → 折线路径（C 段会被栅格化） */
+export function offsetPathModel(model: PathModel, distanceMm: number): PathModel {
+  if (Math.abs(distanceMm) < 1e-9) return model
+  const { points, closed } = samplePathToPolyline(model, 10)
+  if (points.length < 2) return model
+
+  const a = offsetPolyline(points, distanceMm, closed)
+  if (!closed) return polylineToPathModel(a, false)
+
+  // 闭合路径：正距离取面积更大（外扩），负距离取更小（内缩），与绕向无关
+  const b = offsetPolyline(points, -distanceMm, closed)
+  const areaAbs = (pts: PathPoint[]) => {
+    let s = 0
+    for (let i = 0; i < pts.length; i++) {
+      const j = (i + 1) % pts.length
+      s += pts[i].x * pts[j].y - pts[j].x * pts[i].y
+    }
+    return Math.abs(s) / 2
+  }
+  const preferLarger = distanceMm > 0
+  const useA = preferLarger ? areaAbs(a) >= areaAbs(b) : areaAbs(a) <= areaAbs(b)
+  return polylineToPathModel(useA ? a : b, true)
+}
+
+function perpendicularDistance(p: PathPoint, a: PathPoint, b: PathPoint): number {
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  const len2 = dx * dx + dy * dy
+  if (len2 < 1e-18) return Math.hypot(p.x - a.x, p.y - a.y)
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2))
+  const proj = { x: a.x + t * dx, y: a.y + t * dy }
+  return Math.hypot(p.x - proj.x, p.y - proj.y)
+}
+
+/** Douglas–Peucker 折线简化 */
+export function simplifyPolyline(points: PathPoint[], toleranceMm: number): PathPoint[] {
+  if (points.length <= 2 || toleranceMm <= 0) return points.map((p) => ({ ...p }))
+
+  const keep = new Array(points.length).fill(false)
+  keep[0] = true
+  keep[points.length - 1] = true
+
+  const stack: Array<[number, number]> = [[0, points.length - 1]]
+  while (stack.length) {
+    const [start, end] = stack.pop()!
+    let maxDist = 0
+    let maxIdx = -1
+    for (let i = start + 1; i < end; i++) {
+      const d = perpendicularDistance(points[i], points[start], points[end])
+      if (d > maxDist) {
+        maxDist = d
+        maxIdx = i
+      }
+    }
+    if (maxIdx >= 0 && maxDist > toleranceMm) {
+      keep[maxIdx] = true
+      stack.push([start, maxIdx], [maxIdx, end])
+    }
+  }
+
+  return points.filter((_, i) => keep[i]).map((p) => ({ ...p }))
+}
+
+/**
+ * 简化路径：采样为折线后 Douglas–Peucker。
+ * 含 C 段时会转为折线近似。
+ */
+export function simplifyPathModel(model: PathModel, toleranceMm: number): PathModel {
+  const tol = Math.max(0.01, toleranceMm)
+  const { points, closed } = samplePathToPolyline(model, 12)
+  if (points.length < 3) return model
+  let simplified = simplifyPolyline(points, tol)
+  if (closed && simplified.length >= 3) {
+    // 闭合时保证首尾不重复
+    const a = simplified[0]
+    const b = simplified[simplified.length - 1]
+    if (Math.hypot(a.x - b.x, a.y - b.y) < tol) simplified = simplified.slice(0, -1)
+  }
+  if (simplified.length < (closed ? 3 : 2)) return model
+  return polylineToPathModel(simplified, closed)
 }

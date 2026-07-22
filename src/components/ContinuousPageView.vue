@@ -34,6 +34,7 @@ import CanvasEditor from '@/components/CanvasEditor.vue'
 import { useEditorStore } from '@/stores/editorStore'
 import type { PageData } from '@/types'
 import { viewStagePixelSize, normalizeViewRotation } from '@/utils/viewRotation'
+import { RULER_SIZE_PX } from '@/utils/guides'
 
 const MM_TO_PX = 96 / 25.4
 const PAGE_GAP_PX = 28
@@ -59,8 +60,8 @@ function canvasFrameStyle(page: PageData) {
       normalizeViewRotation((page.pageRotate ?? 0) + store.viewRotation),
   )
   return {
-    width: `${stageWidth}px`,
-    height: `${stageHeight}px`,
+    width: `${stageWidth + (store.showRulers ? RULER_SIZE_PX : 0)}px`,
+    height: `${stageHeight + (store.showRulers ? RULER_SIZE_PX : 0)}px`,
   }
 }
 
@@ -71,7 +72,8 @@ function slotMinHeightMm(page: PageData) {
       scale.value,
       normalizeViewRotation((page.pageRotate ?? 0) + store.viewRotation),
   )
-  return stageHeight + PAGE_GAP_PX + LABEL_HEIGHT_PX
+  const rulerExtra = store.showRulers ? RULER_SIZE_PX : 0
+  return stageHeight + rulerExtra + PAGE_GAP_PX + LABEL_HEIGHT_PX
 }
 
 function isPageMounted(index: number) {

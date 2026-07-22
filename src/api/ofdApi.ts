@@ -2,6 +2,7 @@ import axios from 'axios'
 import type { DocumentData, AnnotationData, SignatureVerifyResult, OutlineItem } from '@/types'
 import { unpackSplitPayload, type SplitPackedFile } from '@/utils/splitPayload'
 import { transferProgressConfig } from '@/utils/loadingProgress'
+import { clearAuthStorage, getStoredToken } from '@/api/authApi'
 
 export interface ElementSyncItem {
     pageIndex: number
@@ -19,6 +20,27 @@ const http = axios.create({
     baseURL: '/api/ofd',
     timeout: 60_000,
 })
+
+http.interceptors.request.use((config) => {
+    const token = getStoredToken()
+    if (token) {
+        config.headers = config.headers ?? {}
+        config.headers.Authorization = `Bearer ${token}`
+    }
+    return config
+})
+
+http.interceptors.response.use(
+    (res) => res,
+    (error) => {
+        if (error?.response?.status === 401) {
+            clearAuthStorage()
+            // 触发页面回到登录态（authStore 下次 bootstrap / 监听 storage 亦可）
+            window.dispatchEvent(new CustomEvent('ofd-auth-expired'))
+        }
+        return Promise.reject(error)
+    },
+)
 
 /** 去掉 Windows / 浏览器不允许的文件名字符 */
 export function sanitizeFilename(name: string): string {

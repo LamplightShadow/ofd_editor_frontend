@@ -30,6 +30,12 @@ import {
   roundCornerAtAnchor,
   roundAllPolylineCorners,
   findRoundableAnchorIndices,
+  skewPathModel,
+  mirrorPathModel,
+  rotatePathModel,
+  scalePathModelAbout,
+  offsetPathModel,
+  simplifyPathModel,
 } from './pathModel'
 import { buildEllipsePathLocal, buildRectPathLocal, buildCircleShape, circleBoundsFromDrag, buildSemicircleShape } from './pathShape'
 
@@ -426,5 +432,68 @@ describe('半圆弧 shape', () => {
     // sign=+1 弧心在 y=20；-1 在 y=0
     expect(up.y + up.height).toBeGreaterThan(10)
     expect(down.y).toBeLessThan(10)
+  })
+})
+
+describe('skewPathModel 倾斜剪切', () => {
+  it('水平剪切矩形 → 平行四边形，中心锚点不动', () => {
+    const m = parsePathModel('M 0 0 L 10 0 L 10 10 L 0 10 Z')
+    const skewed = skewPathModel(m, 0, 0, 0.5, 0)
+    // 底边 y=10：x' = x + 0.5*10
+    expect(skewed.commands[1]).toMatchObject({ type: 'L', point: { x: 10, y: 0 } })
+    expect(skewed.commands[2]).toMatchObject({ type: 'L', point: { x: 15, y: 10 } })
+    expect(skewed.commands[3]).toMatchObject({ type: 'L', point: { x: 5, y: 10 } })
+    expect(skewed.commands[0]).toMatchObject({ type: 'M', point: { x: 0, y: 0 } })
+  })
+
+  it('保留 C 段控制点并同步剪切', () => {
+    const m = parsePathModel('M 0 0 C 0 5 5 10 10 10')
+    const skewed = skewPathModel(m, 0, 0, 1, 0)
+    expect(skewed.commands[1]).toMatchObject({
+      type: 'C',
+      cp1: { x: 5, y: 5 },
+      cp2: { x: 15, y: 10 },
+      end: { x: 20, y: 10 },
+    })
+  })
+})
+
+describe('P0 变换：镜像 / 旋转 / 偏移 / 简化', () => {
+  it('垂直镜像：左右翻转，中心 x 不变', () => {
+    const m = parsePathModel('M 0 0 L 10 0 L 10 5 Z')
+    const mirrored = mirrorPathModel(m, 'vertical', 5, 0)
+    expect(mirrored.commands[0]).toMatchObject({ type: 'M', point: { x: 10, y: 0 } })
+    expect(mirrored.commands[1]).toMatchObject({ type: 'L', point: { x: 0, y: 0 } })
+  })
+
+  it('旋转 90° 绕原点', () => {
+    const m = parsePathModel('M 1 0 L 0 0')
+    const rotated = rotatePathModel(m, 0, 0, 90)
+    const p = (rotated.commands[0] as { point: { x: number; y: number } }).point
+    expect(p.x).toBeCloseTo(0, 5)
+    expect(p.y).toBeCloseTo(1, 5)
+  })
+
+  it('相对中心缩放', () => {
+    const m = parsePathModel('M 0 0 L 10 0 L 10 10 L 0 10 Z')
+    const scaled = scalePathModelAbout(m, 5, 5, 2, 2)
+    expect(getPathBounds(scaled).width).toBeCloseTo(20, 5)
+    expect(getPathBounds(scaled).height).toBeCloseTo(20, 5)
+  })
+
+  it('偏移闭合矩形后包围盒变大', () => {
+    const m = parsePathModel('M 0 0 L 10 0 L 10 10 L 0 10 Z')
+    const offset = offsetPathModel(m, 1)
+    const b = getPathBounds(offset)
+    expect(b.width).toBeGreaterThan(10)
+    expect(b.height).toBeGreaterThan(10)
+  })
+
+  it('简化共线折线减少点数', () => {
+    const m = parsePathModel('M 0 0 L 1 0 L 2 0 L 3 0 L 10 0')
+    const simple = simplifyPathModel(m, 0.05)
+    const anchors = extractAnchors(simple)
+    expect(anchors.length).toBeLessThan(5)
+    expect(anchors.length).toBeGreaterThanOrEqual(2)
   })
 })

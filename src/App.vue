@@ -1,5 +1,9 @@
 <template>
-  <div class="app">
+  <div v-if="!auth.bootstrapped" class="auth-boot">
+    <span>正在验证登录状态…</span>
+  </div>
+  <LoginView v-else-if="!auth.isAuthenticated" />
+  <div v-else class="app">
     <!-- Ribbon 工具栏（含品牌 + 标签页） -->
     <Toolbar />
 
@@ -101,12 +105,22 @@
             <span class="status-sep">|</span>
             <span>参考网格</span>
           </template>
+          <template v-if="store.showRulers">
+            <span class="status-sep">|</span>
+            <span>标尺</span>
+          </template>
+          <template v-if="store.showGuides && store.getPageGuides(store.currentPageIndex).length">
+            <span class="status-sep">|</span>
+            <span>参考线 {{ store.getPageGuides(store.currentPageIndex).length }}</span>
+          </template>
           <template v-if="store.watermarkConfig">
             <span class="status-sep">|</span>
             <span>水印：{{ store.watermarkConfig.text }}</span>
           </template>
         </template>
         <span v-else>就绪</span>
+        <span class="status-sep">|</span>
+        <span>{{ auth.displayLabel }}{{ auth.isAdmin ? '（管理员）' : '' }}</span>
       </div>
       <span class="version">OFD Studio v1.0</span>
     </footer>
@@ -149,6 +163,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Upload, Document } from '@element-plus/icons-vue'
 import { useEditorStore } from '@/stores/editorStore'
+import { useAuthStore } from '@/stores/authStore'
 import { saveDocument, openPrintDialog } from '@/composables/useDocumentFileActions'
 import { registerBeforeUnloadGuard } from '@/composables/useUnsavedChangesGuard'
 import { openOfdDocument, openPdfDocument } from '@/composables/useDocumentOpen'
@@ -158,6 +173,7 @@ import {
 } from '@/utils/exportPageImage'
 import Toolbar from '@/components/Toolbar.vue'
 import PagePanel from '@/components/PagePanel.vue'
+import LoginView from '@/components/LoginView.vue'
 import CanvasEditor from '@/components/CanvasEditor.vue'
 import ContinuousPageView from '@/components/ContinuousPageView.vue'
 import RightSidePanel from '@/components/RightSidePanel.vue'
@@ -170,8 +186,10 @@ import {
   type PrintOptions, type CapturedPage,
 } from '@/utils/print'
 import { normalizeViewRotation, viewStagePixelSize } from '@/utils/viewRotation'
+import { RULER_SIZE_PX } from '@/utils/guides'
 
 const store = useEditorStore()
+const auth = useAuthStore()
 const createBlankVisible = ref(false)
 const uploadRef = ref<HTMLInputElement>()
 const pdfRef = ref<HTMLInputElement>()
@@ -201,8 +219,8 @@ const singleCanvasFrameStyle = computed(() => {
       normalizeViewRotation((page.pageRotate ?? 0) + store.viewRotation),
   )
   return {
-    width: `${stageWidth}px`,
-    height: `${stageHeight}px`,
+    width: `${stageWidth + (store.showRulers ? RULER_SIZE_PX : 0)}px`,
+    height: `${stageHeight + (store.showRulers ? RULER_SIZE_PX : 0)}px`,
   }
 })
 
@@ -302,6 +320,14 @@ async function handleExportCurrentPageImage() {
 }
 
 onMounted(() => {
+  void auth.bootstrap()
+
+  const onAuthExpired = () => {
+    auth.logout()
+    ElMessage.warning('登录已过期，请重新登录')
+  }
+  window.addEventListener('ofd-auth-expired', onAuthExpired)
+
   store.registerEditorAreaResolver(() => editorAreaRef.value ?? null)
   store.registerExportCurrentPageImageHook(handleExportCurrentPageImage)
   store.registerExportPagesImageHook(handleExportPagesImage)
@@ -332,6 +358,7 @@ onMounted(() => {
     store.registerExportPagesImageHook(null)
     store.registerThumbnailCaptureHook(null)
     window.removeEventListener('keydown', handleGlobalKeydown)
+    window.removeEventListener('ofd-auth-expired', onAuthExpired)
   })
 })
 
@@ -367,11 +394,19 @@ function handleEscapeKey() {
     store.closeSearch()
     return
   }
+  if (store.isolationGroupId) {
+    store.exitGroupIsolation()
+    return
+  }
+  if (store.currentTool === 'VECTOR_FREE_DISTORT') {
+    store.endFreeDistort()
+    return
+  }
   if (store.selectedAnnotationId) {
     store.selectAnnotation(null)
     return
   }
-  if (store.selectedElementId) {
+  if (store.selectedElementId || store.selectedElementIds.length > 0) {
     store.selectElement(null)
     return
   }
@@ -513,6 +548,57 @@ function handleGlobalKeydown(e: KeyboardEvent) {
     if (store.canRedo) {
       e.preventDefault()
       void store.redo()
+    }
+    return
+  }
+
+  // Ctrl/Cmd + C：复制选中元素（含编组）
+  if (e.key === 'c' || e.key === 'C') {
+    e.preventDefault()
+    const r = store.copySelectedElements()
+    if (r.ok) {
+      ElMessage.success({ message: `已复制 ${r.count} 个对象`, duration: 1200, showClose: false })
+    } else {
+      ElMessage.warning('请先选中要复制的元素')
+    }
+    return
+  }
+
+  // Ctrl/Cmd + V：粘贴
+  if (e.key === 'v' || e.key === 'V') {
+    e.preventDefault()
+    const r = store.pasteClipboardElements()
+    if (r.ok) {
+      ElMessage.success({ message: `已粘贴 ${r.count} 个对象`, duration: 1200, showClose: false })
+    } else {
+      ElMessage.warning('剪贴板为空，请先复制')
+    }
+    return
+  }
+
+  // Ctrl/Cmd + D：原地再制
+  if (e.key === 'd' || e.key === 'D') {
+    e.preventDefault()
+    const r = store.duplicateSelectedElements()
+    if (r.ok) {
+      ElMessage.success({ message: `已再制 ${r.count} 个对象`, duration: 1200, showClose: false })
+    } else {
+      ElMessage.warning('请先选中要再制的元素')
+    }
+    return
+  }
+
+  // Ctrl/Cmd + G：编组；Ctrl/Cmd + Shift + G：解组
+  if (e.key === 'g' || e.key === 'G') {
+    e.preventDefault()
+    if (e.shiftKey) {
+      if (store.ungroupSelectedElements()) {
+        ElMessage.success({ message: '已解组', duration: 1200, showClose: false })
+      }
+    } else if (store.groupSelectedElements()) {
+      ElMessage.success({ message: '已编组', duration: 1200, showClose: false })
+    } else {
+      ElMessage.warning('请先 Shift+点击 选中至少 2 个 PATH')
     }
   }
 }
@@ -757,4 +843,13 @@ async function handleWelcomePdf(e: Event) {
 }
 .status-sep { color: #ccc; }
 .version { color: #aaa; }
+
+.auth-boot {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  color: #667085;
+  background: #f4f6f8;
+  font-size: 14px;
+}
 </style>

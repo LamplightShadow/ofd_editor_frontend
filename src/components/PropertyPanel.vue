@@ -231,7 +231,7 @@
             <el-input-number
                 :model-value="round(store.selectedElement.width)"
                 size="small" :precision="1" :step="1" :min="1"
-                @change="(v: number) => update({ width: v })"
+                @change="(v: number) => updateSize({ width: v })"
             />
           </div>
           <div class="form-item">
@@ -239,7 +239,7 @@
             <el-input-number
                 :model-value="round(store.selectedElement.height)"
                 size="small" :precision="1" :step="1" :min="1"
-                @change="(v: number) => update({ height: v })"
+                @change="(v: number) => updateSize({ height: v })"
             />
           </div>
         </div>
@@ -383,21 +383,14 @@
 
         <template v-if="store.selectedElement.type === 'PATH'">
           <el-divider style="margin: 8px 0" />
+          <div class="path-style-section-title">描边</div>
           <div class="form-item">
-            <label>描边颜色</label>
+            <label>颜色</label>
             <el-color-picker
                 v-model="editPathStrokeColor"
                 size="small"
+                :disabled="!editPathStrokeEnabled"
                 @change="(v: string) => updatePathStyle({ strokeColor: v, pathStrokeEnabled: true })"
-            />
-          </div>
-          <div class="form-item">
-            <label>填充颜色</label>
-            <el-color-picker
-                v-model="editPathFillColor"
-                size="small"
-                :disabled="!editPathFillEnabled"
-                @change="(v: string) => updatePathStyle({ fillColor: v, pathFillEnabled: true })"
             />
           </div>
           <div class="form-item">
@@ -409,32 +402,17 @@
                 :max="10"
                 :step="0.1"
                 :precision="1"
+                :disabled="!editPathStrokeEnabled"
                 @change="(v: number) => updatePathStyle({ lineWidth: v, pathStrokeEnabled: true })"
             />
           </div>
-          <div class="form-item path-style-toggles">
-            <label>样式</label>
-            <div class="toggle-row">
-              <el-checkbox
-                  v-model="editPathStrokeEnabled"
-                  @change="(v: boolean) => updatePathStyle({ pathStrokeEnabled: v })"
-              >
-                描边
-              </el-checkbox>
-              <el-checkbox
-                  v-model="editPathFillEnabled"
-                  @change="onPathFillToggle"
-              >
-                填充
-              </el-checkbox>
-            </div>
-          </div>
           <div class="form-item">
-            <label>虚线预设</label>
+            <label>线型</label>
             <el-select
                 v-model="editPathDashPreset"
                 size="small"
                 style="width: 100%"
+                :disabled="!editPathStrokeEnabled"
                 @change="onPathDashPresetChange"
             >
               <el-option
@@ -451,6 +429,7 @@
                 v-model="editPathLineCap"
                 size="small"
                 style="width: 100%"
+                :disabled="!editPathStrokeEnabled"
                 @change="(v: string) => updatePathStyle({ lineCap: v as any })"
             >
               <el-option label="平头" value="butt" />
@@ -464,6 +443,7 @@
                 v-model="editPathLineJoin"
                 size="small"
                 style="width: 100%"
+                :disabled="!editPathStrokeEnabled"
                 @change="(v: string) => updatePathStyle({ lineJoin: v as any })"
             >
               <el-option label="尖角" value="miter" />
@@ -471,6 +451,36 @@
               <el-option label="斜角" value="bevel" />
             </el-select>
           </div>
+          <div class="form-item path-style-toggles">
+            <el-checkbox
+                v-model="editPathStrokeEnabled"
+                @change="(v: boolean) => updatePathStyle({ pathStrokeEnabled: v })"
+            >
+              启用描边
+            </el-checkbox>
+          </div>
+
+          <el-divider style="margin: 8px 0" />
+          <div class="path-style-section-title">填充</div>
+          <div class="form-item">
+            <label>颜色</label>
+            <el-color-picker
+                v-model="editPathFillColor"
+                size="small"
+                :disabled="!editPathFillEnabled"
+                @change="(v: string) => updatePathStyle({ fillColor: v, pathFillEnabled: true })"
+            />
+          </div>
+          <div class="form-item path-style-toggles">
+            <el-checkbox
+                v-model="editPathFillEnabled"
+                @change="onPathFillToggle"
+            >
+              启用填充
+            </el-checkbox>
+          </div>
+
+          <el-divider style="margin: 8px 0" />
           <div class="form-item path-style-toggles">
             <label>变换</label>
             <div class="toggle-row">
@@ -482,6 +492,118 @@
               </el-checkbox>
             </div>
           </div>
+          <div class="form-row">
+            <div class="form-item">
+              <label>水平倾斜°</label>
+              <el-input-number
+                  v-model="pathSkewH"
+                  size="small"
+                  :precision="1"
+                  :step="5"
+                  :min="-70"
+                  :max="70"
+              />
+            </div>
+            <div class="form-item">
+              <label>垂直倾斜°</label>
+              <el-input-number
+                  v-model="pathSkewV"
+                  size="small"
+                  :precision="1"
+                  :step="5"
+                  :min="-70"
+                  :max="70"
+              />
+            </div>
+          </div>
+          <div class="form-item">
+            <el-button size="small" style="width:100%" @click="onApplyPathSkew">
+              应用倾斜角
+            </el-button>
+          </div>
+          <div class="form-item">
+            <label>几何旋转°</label>
+            <el-input-number
+                v-model="pathGeomRotateDeg"
+                size="small"
+                :min="-360"
+                :max="360"
+                :step="5"
+                :precision="1"
+            />
+          </div>
+          <div class="form-row">
+            <div class="form-item">
+              <label>复制缩放%</label>
+              <el-input-number
+                  v-model="pathRotateCopyScalePercent"
+                  size="small"
+                  :min="5"
+                  :max="2000"
+                  :step="5"
+                  :precision="0"
+              />
+            </div>
+            <div class="form-item">
+              <label>复制份数</label>
+              <el-input-number
+                  v-model="pathRotateCopyCount"
+                  size="small"
+                  :min="1"
+                  :max="36"
+                  :step="1"
+                  :precision="0"
+              />
+            </div>
+          </div>
+          <div class="form-item">
+            <div class="align-btn-row">
+              <el-button size="small" @click="onGeomRotate(pathGeomRotateDeg)">旋转</el-button>
+              <el-button size="small" @click="onGeomRotate(-Math.abs(pathGeomRotateDeg))">反向</el-button>
+              <el-button size="small" @click="onGeomRotateCopy">旋转复制</el-button>
+            </div>
+          </div>
+
+          <el-divider style="margin: 8px 0" />
+          <div class="path-style-section-title">变形</div>
+          <div class="form-item">
+            <label>弯曲度 %</label>
+            <el-input-number
+                v-model="pathWarpBendPercent"
+                size="small"
+                :min="-100"
+                :max="100"
+                :step="5"
+                :precision="0"
+            />
+          </div>
+          <div class="form-item">
+            <div class="align-btn-row">
+              <el-button size="small" @click="onWarpArc('arc')">弧形</el-button>
+              <el-button size="small" @click="onWarpArc('arch')">拱形</el-button>
+              <el-button
+                  size="small"
+                  :type="store.currentTool === 'VECTOR_FREE_DISTORT' ? 'primary' : 'default'"
+                  @click="onToggleFreeDistort"
+              >
+                自由变形
+              </el-button>
+            </div>
+          </div>
+          <div class="form-item">
+            <div class="align-btn-row">
+              <el-button size="small" @click="onOutlineStroke">轮廓化描边</el-button>
+              <el-button size="small" @click="onClosePath">闭合</el-button>
+              <el-button size="small" @click="onOpenPath">打开</el-button>
+            </div>
+          </div>
+          <div class="form-item">
+            <div class="align-btn-row">
+              <el-button size="small" @click="onJoinPathEnds">连接首尾</el-button>
+              <el-button size="small" @click="onBreakPathAnchor">断开锚点</el-button>
+            </div>
+          </div>
+
           <el-divider style="margin: 8px 0" />
           <div class="form-item">
             <label>倒圆角半径 (mm)</label>
@@ -732,6 +854,123 @@ function round(val: number) {
   return Math.round(val * 10) / 10
 }
 
+function updateSize(partial: { width?: number; height?: number }) {
+  if (!store.selectedElementId) return
+  const el = store.selectedElement
+  if (!el) return
+  if (el.type === 'PATH') {
+    const w = partial.width ?? el.width
+    const h = partial.height ?? el.height
+    const r = store.scaleSelectedPathToSize(w, h)
+    if (!r.ok) ElMessage.warning(r.message || '缩放失败')
+    return
+  }
+  update(partial)
+}
+
+const pathSkewH = ref(0)
+const pathSkewV = ref(0)
+const pathGeomRotateDeg = ref(15)
+const pathRotateCopyScalePercent = ref(100)
+const pathRotateCopyCount = ref(1)
+const pathWarpBendPercent = ref(35)
+
+function onApplyPathSkew() {
+  const r = store.skewSelectedPathByAngles(pathSkewH.value, pathSkewV.value)
+  if (r.ok) {
+    pathSkewH.value = 0
+    pathSkewV.value = 0
+    ElMessage.success({ message: '已应用倾斜', duration: 1000, showClose: false })
+  } else {
+    ElMessage.warning(r.message || '请先选中 PATH')
+  }
+}
+
+function onWarpArc(style: 'arc' | 'arch') {
+  const bend = pathWarpBendPercent.value / 100
+  if (Math.abs(bend) < 1e-6) {
+    ElMessage.warning('请先设置非零弯曲度')
+    return
+  }
+  const r = store.warpSelectedPathArc(bend, style, true)
+  if (r.ok) ElMessage.success({ message: style === 'arch' ? '已应用拱形封套' : '已应用弧形封套', duration: 1000, showClose: false })
+  else ElMessage.warning(r.message || '请先选中 PATH')
+}
+
+function onToggleFreeDistort() {
+  if (store.currentTool === 'VECTOR_FREE_DISTORT') {
+    store.endFreeDistort()
+    ElMessage.success({ message: '已退出自由变形', duration: 1000, showClose: false })
+    return
+  }
+  store.setTool('VECTOR_FREE_DISTORT')
+  if (store.currentTool === 'VECTOR_FREE_DISTORT') {
+    ElMessage.success({ message: '拖动紫色四角进行自由变形', duration: 1600, showClose: false })
+  } else {
+    ElMessage.warning('无法进入自由变形')
+  }
+}
+
+function onOutlineStroke() {
+  const r = store.outlineSelectedPathStroke()
+  if (r.ok) ElMessage.success({ message: '已轮廓化描边', duration: 1000, showClose: false })
+  else ElMessage.warning(r.message || '轮廓化失败')
+}
+
+function onClosePath() {
+  const r = store.closeSelectedPath()
+  if (r.ok) ElMessage.success({ message: '已闭合路径', duration: 1000, showClose: false })
+  else ElMessage.warning(r.message || '路径可能已闭合')
+}
+
+function onOpenPath() {
+  const r = store.openSelectedPath()
+  if (r.ok) ElMessage.success({ message: '已打开路径', duration: 1000, showClose: false })
+  else ElMessage.warning(r.message || '路径可能未闭合')
+}
+
+function onJoinPathEnds() {
+  const r = store.joinSelectedPathEnds()
+  if (r.ok) ElMessage.success({ message: '已连接首尾', duration: 1000, showClose: false })
+  else ElMessage.warning(r.message || '连接失败')
+}
+
+function onBreakPathAnchor() {
+  const r = store.breakSelectedPathAtAnchor()
+  if (r.ok) ElMessage.success({ message: '已断开锚点', duration: 1000, showClose: false })
+  else ElMessage.warning(r.message || '请先在直接选择下选中一个锚点')
+}
+
+function onGeomRotate(angleDeg: number) {
+  if (!Number.isFinite(angleDeg) || Math.abs(angleDeg) < 1e-9) {
+    ElMessage.warning('请先设置非零旋转角度')
+    return
+  }
+  const r = store.rotateSelectedPathAroundCenter(angleDeg)
+  if (!r.ok) ElMessage.warning(r.message || '请先选中 PATH')
+}
+
+function onGeomRotateCopy() {
+  const angle = pathGeomRotateDeg.value
+  if (!Number.isFinite(angle) || Math.abs(angle) < 1e-9) {
+    ElMessage.warning('请先设置非零旋转角度')
+    return
+  }
+  const scale = pathRotateCopyScalePercent.value / 100
+  const count = pathRotateCopyCount.value
+  const r = store.rotateCopySelectedPath({ angleDeg: angle, scale, count })
+  if (r.ok) {
+    const scaleTip = Math.abs(scale - 1) < 1e-9 ? '' : `，缩放 ${pathRotateCopyScalePercent.value}%/步`
+    ElMessage.success({
+      message: `已旋转复制 ${r.count} 份（${angle}°/步${scaleTip}）`,
+      duration: 1600,
+      showClose: false,
+    })
+  } else {
+    ElMessage.warning(r.message || '请先选中 PATH')
+  }
+}
+
 function update(changes: Partial<ElementData>) {
   if (!store.selectedElementId) return
   const el = store.selectedElement
@@ -820,7 +1059,7 @@ function onPathFillToggle(enabled: boolean) {
 
 function onPathDashPresetChange(presetId: string) {
   const pattern = dashPatternFromPresetId(presetId)
-  updatePathStyle({ dashPattern: pattern })
+  updatePathStyle({ dashPattern: pattern, pathStrokeEnabled: true })
 }
 
 function align(mode: 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom') {

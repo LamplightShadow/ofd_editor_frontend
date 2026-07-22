@@ -43,9 +43,12 @@ export type ToolType =
     | 'VECTOR_CIRCLE'  // 正文层矢量：正圆
     | 'VECTOR_ARC'     // 正文层矢量：半圆弧（可反转；第二条可拼成圆）
     | 'VECTOR_POLYLINE' // 正文层矢量：折线（点击加点，双击结束）
-    | 'VECTOR_POLYGON' // 正文层矢量：多边形
+    | 'VECTOR_POLYGON' // 正文层矢量：自由多边形（点击加点）
+    | 'VECTOR_REGULAR_POLYGON' // 正文层矢量：正多边形（拖拽；↑↓/[ ] 调边数）
     | 'VECTOR_PEN'     // 钢笔：点击落 M/L，近起点闭合，Enter/Esc 结束开放路径
     | 'DIRECT_SELECT'  // 直接选择：编辑 PATH 锚点 / 贝塞尔手柄
+    | 'VECTOR_SKEW'    // 倾斜：点锚点定中心，拖拽绕中心剪切（如矩形→平行四边形）
+    | 'VECTOR_FREE_DISTORT' // 自由变形：拖四角双线性拉扯
 
 // ========== OFD原生元素（保持不变） ==========
 export interface ElementData {
@@ -100,6 +103,11 @@ export interface ElementData {
     lineCap?: 'butt' | 'round' | 'square'
     /** 连接：miter / round / bevel */
     lineJoin?: 'miter' | 'round' | 'bevel'
+    /**
+     * 编辑器编组 ID（同组元素共享）。仅会话内/撤销栈有效，不写入 OFD 节点。
+     * SELECT 点组内任意子对象会选中整组；DIRECT_SELECT / 双击进入隔离后可选单个子对象。
+     */
+    groupId?: string
     resourceId?: string
     imageBase64?: string
     imageUrl?: string
@@ -183,6 +191,17 @@ export interface AnnotationReplyData {
     parentReplyId?: string
     createdAt?: number
     updatedAt?: number
+}
+
+/** 编辑器参考线方向 */
+export type GuideOrientation = 'h' | 'v'
+
+/** 编辑器参考线（从标尺拖出；仅会话，不写入 OFD） */
+export interface GuideLine {
+  id: string
+  orientation: GuideOrientation
+  /** 水平线为 y(mm)，垂直线为 x(mm) */
+  positionMm: number
 }
 
 // ========== 页面数据（扩展加入注释） ==========

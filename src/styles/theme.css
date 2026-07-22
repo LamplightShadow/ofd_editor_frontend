@@ -159,6 +159,13 @@ html, body {
   gap: 12px;
   flex-wrap: wrap;
 }
+.property-panel .path-style-section-title {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  letter-spacing: 0.02em;
+}
 .property-panel .align-btn-row {
   display: flex;
   flex-wrap: wrap;

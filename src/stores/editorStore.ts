@@ -20,11 +20,16 @@ import {
 } from '@/utils/textBounds'
 import {
     buildLineShape, buildRectShape, buildEllipseShape, buildCircleShape, buildSemicircleShape,
-    buildCircleFromDiameter, buildPolylineShape, translateSvgPath,
+    buildCircleFromDiameter, buildPolylineShape, buildRegularPolygonShape, translateSvgPath,
     type PathShapeResult,
     type ArcSign,
 } from '@/utils/pathShape'
 import { normalizeElementPathIfNeeded } from '@/utils/pathModel'
+import {
+    makeGuide,
+    clampGuidePosition,
+} from '@/utils/guides'
+import type { GuideLine, GuideOrientation } from '@/types'
 import {
     parsePathModel,
     extractAnchors,
@@ -41,6 +46,15 @@ import {
     roundCornersAtAnchors,
     roundAllPolylineCorners,
     canRoundCorner,
+    skewPathModel,
+    getPathBounds,
+    getPathCenter,
+    mirrorPathModel,
+    rotatePathModel,
+    scalePathModelAbout,
+    offsetPathModel,
+    simplifyPathModel,
+    isPathClosed,
     type PathAnchor,
     type PathHandle,
     type AnchorSmoothMode,
@@ -49,6 +63,18 @@ import {
 import type { ElementSyncItem } from '@/api/ofdApi'
 import type { ExportPagesOptions } from '@/utils/exportPageImage'
 import { effectivePageSizeMm, normalizeViewRotation } from '@/utils/viewRotation'
+import {
+    warpArcPathModel,
+    freeDistortPathModel,
+    defaultDistortCorners,
+    outlineStrokePathModel,
+    closePathModel,
+    openPathModel,
+    joinPathEnds,
+    breakPathAtAnchor,
+    type FreeDistortCorners,
+    type WarpArcStyle,
+} from '@/utils/pathDeform'
 import {
     getElementImageSrc,
     computeElementBoundsAfterCrop,
@@ -77,6 +103,12 @@ export const useEditorStore = defineStore('editor', () => {
     /** 视图旋转角度（仅显示，0/90/180/270，不写回 OFD） */
     const viewRotation = ref(0)
     const selectedElementId = ref<string | null>(null)
+    /** 当前选中的元素 ID 列表（多选 / 整组选中时多于 1 个） */
+    const selectedElementIds = ref<string[]>([])
+    /** 以「整组」选中时的 groupId；为 null 表示选的是单个或松散多选 */
+    const selectedGroupId = ref<string | null>(null)
+    /** 隔离编辑中的 groupId；非空时 SELECT 只选组内子对象 */
+    const isolationGroupId = ref<string | null>(null)
     const scale = ref(1.0)
     const isLoading = ref(false)
     const loadingText = ref('处理中...')
@@ -128,6 +160,135 @@ export const useEditorStore = defineStore('editor', () => {
         showReferenceGrid.value = on ?? !showReferenceGrid.value
     }
 
+    /** 标尺 + 从标尺拖出参考线（仅编辑器，不写入 OFD） */
+    const showRulers = ref(false)
+    /** 显示已拖出的参考线 */
+    const showGuides = ref(true)
+    /** 锁定后不可拖动/删除参考线 */
+    const guidesLocked = ref(false)
+    /** 每页参考线 */
+    const guidesMap = reactive<Record<number, GuideLine[]>>({})
+
+    function getPageGuides(pageIndex: number) {
+        return guidesMap[pageIndex] ?? []
+    }
+
+    function setShowRulers(on: boolean) {
+        showRulers.value = on
+        if (on) showGuides.value = true
+    }
+
+    function toggleRulers(on?: boolean) {
+        const next = on ?? !showRulers.value
+        setShowRulers(next)
+    }
+
+    function setShowGuides(on: boolean) {
+        showGuides.value = on
+    }
+
+    function toggleGuides(on?: boolean) {
+        showGuides.value = on ?? !showGuides.value
+    }
+
+    function setGuidesLocked(on: boolean) {
+        guidesLocked.value = on
+    }
+
+    function toggleGuidesLocked(on?: boolean) {
+        guidesLocked.value = on ?? !guidesLocked.value
+    }
+
+    function clearGuidesMap() {
+        for (const key of Object.keys(guidesMap)) {
+            delete guidesMap[Number(key)]
+        }
+    }
+
+    function addGuide(pageIndex: number, orientation: GuideOrientation, positionMm: number) {
+        const page = document.value?.pages[pageIndex]
+        if (!page) return null
+        const max = orientation === 'h' ? page.height : page.width
+        const guide = makeGuide(orientation, clampGuidePosition(positionMm, max))
+        if (!guidesMap[pageIndex]) guidesMap[pageIndex] = []
+        guidesMap[pageIndex].push(guide)
+        showGuides.value = true
+        return guide
+    }
+
+    function updateGuidePosition(pageIndex: number, guideId: string, positionMm: number) {
+        const list = guidesMap[pageIndex]
+        if (!list) return
+        const g = list.find((x) => x.id === guideId)
+        if (!g) return
+        const page = document.value?.pages[pageIndex]
+        if (!page) return
+        const max = g.orientation === 'h' ? page.height : page.width
+        g.positionMm = clampGuidePosition(positionMm, max)
+    }
+
+    function removeGuide(pageIndex: number, guideId: string) {
+        const list = guidesMap[pageIndex]
+        if (!list) return
+        const idx = list.findIndex((x) => x.id === guideId)
+        if (idx >= 0) list.splice(idx, 1)
+    }
+
+    function clearPageGuides(pageIndex?: number) {
+        const idx = pageIndex ?? currentPageIndex.value
+        if (guidesMap[idx]) guidesMap[idx] = []
+    }
+
+    function clearAllGuides() {
+        clearGuidesMap()
+    }
+
+    function remapGuidesAfterInsert(insertAt: number) {
+        if (!document.value) return
+        const count = document.value.pageCount
+        const shifted: Record<number, GuideLine[]> = {}
+        for (let i = 0; i < count; i++) {
+            if (i < insertAt) shifted[i] = [...(guidesMap[i] ?? [])]
+            else if (i === insertAt) shifted[i] = []
+            else shifted[i] = [...(guidesMap[i - 1] ?? [])]
+        }
+        clearGuidesMap()
+        for (const [k, v] of Object.entries(shifted)) {
+            guidesMap[Number(k)] = v
+        }
+    }
+
+    function remapGuidesAfterDelete(deletedIndex: number) {
+        if (!document.value) return
+        const count = document.value.pageCount
+        const next: Record<number, GuideLine[]> = {}
+        for (let i = 0; i < count; i++) {
+            const srcIdx = i >= deletedIndex ? i + 1 : i
+            next[i] = [...(guidesMap[srcIdx] ?? [])]
+        }
+        clearGuidesMap()
+        for (const [k, v] of Object.entries(next)) {
+            guidesMap[Number(k)] = v
+        }
+    }
+
+    function remapGuidesAfterMove(fromIndex: number, toIndex: number) {
+        if (!document.value || fromIndex === toIndex) return
+        const count = document.value.pageCount
+        const snapshot: Record<number, GuideLine[]> = {}
+        for (const key of Object.keys(guidesMap)) {
+            snapshot[Number(key)] = [...(guidesMap[Number(key)] ?? [])]
+        }
+        clearGuidesMap()
+        const order = Array.from({ length: count }, (_, i) => i)
+        // page move: reorder like annotations — need to check how annotations do it
+        const items = order.map((i) => snapshot[i] ?? [])
+        const [moved] = items.splice(fromIndex, 1)
+        items.splice(toIndex, 0, moved ?? [])
+        items.forEach((list, newIdx) => {
+            guidesMap[newIdx] = list
+        })
+    }
     /** 全局文本水印（保存/导出时烘焙） */
     const watermarkConfig = ref<WatermarkConfig | null>(null)
 
@@ -296,6 +457,8 @@ export const useEditorStore = defineStore('editor', () => {
     const vectorLineWidth = ref(0.4)
     const vectorFillEnabled = ref(false)
     const vectorStrokeEnabled = ref(true)
+    /** 正多边形边数（3–24），绘制中可用 ↑↓ / [ ] 调节 */
+    const regularPolygonSides = ref(6)
     const vectorDashPattern = ref<string | undefined>(undefined)
     const vectorLineCap = ref<'butt' | 'round' | 'square'>('round')
     const vectorLineJoin = ref<'miter' | 'round' | 'bevel'>('round')
@@ -341,8 +504,33 @@ export const useEditorStore = defineStore('editor', () => {
     /** 后端 deleteElementNode 支持移除的元素类型（TEXT / IMAGE / PATH） */
     const DELETABLE_ELEMENT_TYPES = ['TEXT', 'IMAGE', 'PATH'] as const
     const canDeleteSelectedElement = computed(() => {
-        const t = selectedElement.value?.type
-        return !!t && (DELETABLE_ELEMENT_TYPES as readonly string[]).includes(t)
+        const page = currentPage.value
+        if (!page || selectedElementIds.value.length === 0) return false
+        return selectedElementIds.value.every((id) => {
+            const t = page.elements.find((e) => e.id === id && !e.isDeleted)?.type
+            return !!t && (DELETABLE_ELEMENT_TYPES as readonly string[]).includes(t)
+        })
+    })
+
+    const canGroupSelected = computed(() => {
+        const page = currentPage.value
+        if (!page || selectedElementIds.value.length < 2) return false
+        const paths = selectedElementIds.value
+            .map((id) => page.elements.find((e) => e.id === id && !e.isDeleted))
+            .filter((e): e is ElementData => !!e && e.type === 'PATH')
+        if (paths.length < 2 || paths.length !== selectedElementIds.value.length) return false
+        const gids = new Set(paths.map((e) => e.groupId).filter(Boolean))
+        // 已是同一组且正好整组选中 → 无需再编组
+        if (gids.size === 1 && selectedGroupId.value && paths.every((e) => e.groupId === selectedGroupId.value)) {
+            return false
+        }
+        return true
+    })
+
+    const canUngroupSelected = computed(() => {
+        if (selectedGroupId.value) return true
+        const el = selectedElement.value
+        return !!(el?.groupId)
     })
 
     const canUndo = computed(() => historyIndex.value > 0)
@@ -373,6 +561,8 @@ export const useEditorStore = defineStore('editor', () => {
     const isHandTool = computed(() => currentTool.value === 'HAND')
     const isSelectTool = computed(() => currentTool.value === 'SELECT')
     const isDirectSelectTool = computed(() => currentTool.value === 'DIRECT_SELECT')
+    const isSkewTool = computed(() => currentTool.value === 'VECTOR_SKEW')
+    const isFreeDistortTool = computed(() => currentTool.value === 'VECTOR_FREE_DISTORT')
     const isTypewriterTool = computed(() => currentTool.value === 'TYPEWRITER')
     const isVectorTool = computed(() =>
         currentTool.value === 'VECTOR_LINE'
@@ -382,6 +572,7 @@ export const useEditorStore = defineStore('editor', () => {
         || currentTool.value === 'VECTOR_ARC'
         || currentTool.value === 'VECTOR_POLYLINE'
         || currentTool.value === 'VECTOR_POLYGON'
+        || currentTool.value === 'VECTOR_REGULAR_POLYGON'
         || currentTool.value === 'VECTOR_PEN',
     )
     const isPolylineTool = computed(() =>
@@ -394,11 +585,21 @@ export const useEditorStore = defineStore('editor', () => {
         && currentTool.value !== 'HAND'
         && currentTool.value !== 'TYPEWRITER'
         && currentTool.value !== 'DIRECT_SELECT'
+        && currentTool.value !== 'VECTOR_SKEW'
+        && currentTool.value !== 'VECTOR_FREE_DISTORT'
         && !isVectorTool.value
     )
 
     /** 直接选择：当前选中的锚点下标 */
     const selectedAnchorIndices = ref<number[]>([])
+    /** 倾斜工具：作为剪切中心的锚点下标 */
+    const skewPivotAnchorIndex = ref<number | null>(null)
+    /**
+     * 自由变形四角（局部坐标 TL/TR/BR/BL）。
+     * 进入 VECTOR_FREE_DISTORT 时初始化；拖拽时更新并预览。
+     */
+    const freeDistortCorners = ref<FreeDistortCorners | null>(null)
+    const freeDistortSnapshot = ref<{ pathData: string; x: number; y: number } | null>(null)
 
     const hasPendingStamp = computed(() => !!pendingStampImage.value)
 
@@ -569,7 +770,8 @@ export const useEditorStore = defineStore('editor', () => {
         }
 
         page.elements.push(element)
-        selectedElementId.value = id
+        setElementSelection([id], null)
+        isolationGroupId.value = null
         selectedAnnotationId.value = null
         currentTool.value = 'SELECT'
         saveToHistory()
@@ -689,7 +891,8 @@ export const useEditorStore = defineStore('editor', () => {
         }
 
         page.elements.push(element)
-        selectedElementId.value = id
+        setElementSelection([id], null)
+        isolationGroupId.value = null
         selectedAnnotationId.value = null
         currentTool.value = 'SELECT'
         saveToHistory()
@@ -737,7 +940,8 @@ export const useEditorStore = defineStore('editor', () => {
             originalRotation: 0,
         }
         page.elements.push(element)
-        selectedElementId.value = id
+        setElementSelection([id], null)
+        isolationGroupId.value = null
         selectedAnnotationId.value = null
         if (!opts?.stayOnTool) {
             currentTool.value = 'SELECT'
@@ -807,7 +1011,32 @@ export const useEditorStore = defineStore('editor', () => {
         if (!document.value.pages[pageIndex]) return null
         const shape = buildPolylineShape(points, closed)
         const fillOn = closed && vectorFillEnabled.value
-        return pushNewPathElement(pageIndex, shape, fillOn)
+        // 保持折线/多边形工具，便于连续绘制
+        return pushNewPathElement(pageIndex, shape, fillOn, { stayOnTool: true })
+    }
+
+    function addVectorRegularPolygon(
+        pageIndex: number,
+        cx: number,
+        cy: number,
+        radius: number,
+        sides: number,
+        rotationRad: number,
+    ): string | null {
+        if (!document.value || !document.value.pages[pageIndex]) return null
+        if (radius < 0.5) return null
+        const shape = buildRegularPolygonShape(cx, cy, radius, sides, rotationRad)
+        const fillOn = vectorFillEnabled.value
+        return pushNewPathElement(pageIndex, shape, fillOn, { stayOnTool: true })
+    }
+
+    function setRegularPolygonSides(n: number) {
+        regularPolygonSides.value = Math.max(3, Math.min(24, Math.round(n)))
+    }
+
+    function nudgeRegularPolygonSides(delta: number): number {
+        setRegularPolygonSides(regularPolygonSides.value + delta)
+        return regularPolygonSides.value
     }
 
     /** 钢笔：页坐标结点（可含 C）→ 局部 PATH 元素 */
@@ -870,11 +1099,30 @@ export const useEditorStore = defineStore('editor', () => {
 
     function applyVectorStyleToSelectedPath(
         changes: Partial<Pick<ElementData,
-            'fillColor' | 'strokeColor' | 'lineWidth' | 'pathFillEnabled' | 'pathStrokeEnabled'>>,
+            | 'fillColor'
+            | 'strokeColor'
+            | 'lineWidth'
+            | 'pathFillEnabled'
+            | 'pathStrokeEnabled'
+            | 'dashPattern'
+            | 'lineCap'
+            | 'lineJoin'>>,
     ) {
-        const el = selectedElement.value
-        if (!el || el.type !== 'PATH' || !selectedElementId.value) return
-        updateElement(currentPageIndex.value, selectedElementId.value, changes)
+        const page = currentPage.value
+        if (!page || selectedElementIds.value.length === 0) return
+        const pathIds = selectedElementIds.value.filter((id) => {
+            const el = page.elements.find((e) => e.id === id && !e.isDeleted)
+            return el?.type === 'PATH'
+        })
+        if (pathIds.length === 0) return
+        if (pathIds.length === 1) {
+            updateElement(currentPageIndex.value, pathIds[0], changes)
+            return
+        }
+        updateElementsBatch(
+            currentPageIndex.value,
+            pathIds.map((id) => ({ id, changes })),
+        )
     }
 
     type AlignMode = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
@@ -964,7 +1212,8 @@ export const useEditorStore = defineStore('editor', () => {
         }
 
         page.elements.push(element)
-        selectedElementId.value = id
+        setElementSelection([id], null)
+        isolationGroupId.value = null
         selectedAnnotationId.value = null
         currentTool.value = 'SELECT'
         saveToHistory()
@@ -996,7 +1245,8 @@ export const useEditorStore = defineStore('editor', () => {
         document.value = doc
         ensurePageIds()
         currentPageIndex.value = 0
-        selectedElementId.value = null
+        clearElementSelection()
+        isolationGroupId.value = null
         selectedAnnotationId.value = null
         pendingStampImage.value = null
         rightPanelTab.value = 'properties'
@@ -1010,6 +1260,9 @@ export const useEditorStore = defineStore('editor', () => {
         viewRotation.value = 0
         resetHistory()
         clearAnnotationRepliesMap()
+        clearGuidesMap()
+        elementClipboard.value = []
+        pasteGeneration = 0
         outlines.value = doc.outlines ?? []
         leftPanelTab.value = 'pages'
         void nextTick(() => { fitToWidth() })
@@ -1262,7 +1515,8 @@ export const useEditorStore = defineStore('editor', () => {
         if (index < 0 || index >= (document.value?.pageCount ?? 0)) return
         currentPageIndex.value = index
         if (!opts?.preserveSelection) {
-            selectedElementId.value = null
+            clearElementSelection()
+            isolationGroupId.value = null
             selectedAnnotationId.value = null
         }
         if (opts?.scrollIntoView) {
@@ -1292,30 +1546,356 @@ export const useEditorStore = defineStore('editor', () => {
         })
     }
 
-    function selectElement(id: string | null) {
-        // 同一元素再次点选时保留锚点选中（直接选择下很常见）
-        if (id && id === selectedElementId.value) {
-            selectedAnnotationId.value = null
-            const el = currentPage.value?.elements.find((e) => e.id === id)
-            if (el?.type === 'PATH') {
-                syncVectorStyleFromElement(el)
-                ensureSelectedPathNormalized()
-            }
-            return
+    function syncPrimarySelectionStyle(id: string | null) {
+        if (!id || !currentPage.value) return
+        const el = currentPage.value.elements.find((e) => e.id === id && !e.isDeleted)
+        if (!el) return
+        if (el.type === 'TEXT') syncTypewriterStyleFromElement(el)
+        if (el.type === 'PATH') {
+            syncVectorStyleFromElement(el)
+            ensureSelectedPathNormalized()
         }
-        selectedElementId.value = id
+    }
+
+    /** 底层设置选中列表；groupId 非空表示「整组选中」 */
+    function setElementSelection(ids: string[], groupId: string | null = null) {
+        const unique = [...new Set(ids.filter(Boolean))]
+        selectedElementIds.value = unique
+        selectedElementId.value = unique[0] ?? null
+        selectedGroupId.value = groupId
         clearPathAnchorSelection()
-        if (id) {
+        if (unique.length > 0) {
             selectedAnnotationId.value = null
-            const el = currentPage.value?.elements.find((e) => e.id === id)
-            if (el?.type === 'TEXT') syncTypewriterStyleFromElement(el)
-            if (el?.type === 'PATH') {
-                syncVectorStyleFromElement(el)
-                ensureSelectedPathNormalized()
+            syncPrimarySelectionStyle(unique[0])
+        }
+    }
+
+    function clearElementSelection() {
+        selectedElementIds.value = []
+        selectedElementId.value = null
+        selectedGroupId.value = null
+        clearPathAnchorSelection()
+    }
+
+    function getGroupMembers(groupId: string, pageIndex = currentPageIndex.value): ElementData[] {
+        const page = document.value?.pages[pageIndex]
+        if (!page || !groupId) return []
+        return page.elements.filter((e) => !e.isDeleted && e.groupId === groupId)
+    }
+
+    function getGroupMemberIds(groupId: string, pageIndex = currentPageIndex.value): string[] {
+        return getGroupMembers(groupId, pageIndex).map((e) => e.id)
+    }
+
+    function isElementInSelection(id: string): boolean {
+        return selectedElementIds.value.includes(id)
+    }
+
+    /** 清理成员不足 2 个的残留编组 */
+    function pruneDegenerateGroups(pageIndex: number) {
+        const page = document.value?.pages[pageIndex]
+        if (!page) return
+        const counts = new Map<string, number>()
+        for (const el of page.elements) {
+            if (el.isDeleted || !el.groupId) continue
+            counts.set(el.groupId, (counts.get(el.groupId) ?? 0) + 1)
+        }
+        for (const el of page.elements) {
+            if (!el.groupId) continue
+            if ((counts.get(el.groupId) ?? 0) < 2) {
+                delete el.groupId
             }
         }
     }
 
+    /**
+     * 点选元素（Illustrator 式）：
+     * - SELECT + 组内（未隔离）→ 整组
+     * - SELECT + 隔离中 / 无组 → 单个；Shift 加选
+     * - DIRECT_SELECT → 始终选叶子，并进入该组隔离
+     */
+    function selectElement(
+        id: string | null,
+        opts?: { additive?: boolean; asLeaf?: boolean; preferGroup?: boolean },
+    ) {
+        if (!id) {
+            clearElementSelection()
+            return
+        }
+
+        const page = currentPage.value
+        const el = page?.elements.find((e) => e.id === id && !e.isDeleted)
+        if (!el || el.type === 'SEAL') return
+
+        const additive = !!opts?.additive
+        const asLeaf = !!opts?.asLeaf || isDirectSelectTool.value
+        const preferGroup = opts?.preferGroup !== false && isSelectTool.value && !asLeaf
+
+        // 直接选择：进组隔离，只选叶子
+        if (asLeaf) {
+            if (el.groupId) isolationGroupId.value = el.groupId
+            // 同一元素再次点选时保留锚点选中
+            if (id === selectedElementId.value && selectedElementIds.value.length === 1) {
+                selectedAnnotationId.value = null
+                syncPrimarySelectionStyle(id)
+                return
+            }
+            setElementSelection([id], null)
+            return
+        }
+
+        // Shift 加选（松散多选，用于编组）
+        if (additive && isSelectTool.value) {
+            let next = [...selectedElementIds.value]
+            if (preferGroup && el.groupId && isolationGroupId.value !== el.groupId) {
+                const memberIds = getGroupMemberIds(el.groupId)
+                const allIn = memberIds.every((mid) => next.includes(mid))
+                next = allIn
+                    ? next.filter((mid) => !memberIds.includes(mid))
+                    : [...new Set([...next, ...memberIds])]
+                setElementSelection(next, null)
+                return
+            }
+            if (next.includes(id)) next = next.filter((x) => x !== id)
+            else next.push(id)
+            setElementSelection(next, null)
+            return
+        }
+
+        // SELECT：未隔离时点组员 → 整组
+        if (
+            preferGroup
+            && el.groupId
+            && isolationGroupId.value !== el.groupId
+        ) {
+            const memberIds = getGroupMemberIds(el.groupId)
+            if (
+                selectedGroupId.value === el.groupId
+                && selectedElementIds.value.length === memberIds.length
+            ) {
+                selectedAnnotationId.value = null
+                syncPrimarySelectionStyle(id)
+                // 更新主选中为当前点击的子对象（属性面板跟随）
+                selectedElementId.value = id
+                return
+            }
+            setElementSelection(memberIds, el.groupId)
+            selectedElementId.value = id
+            syncPrimarySelectionStyle(id)
+            return
+        }
+
+        // 隔离中或无组：单选
+        if (id === selectedElementId.value && selectedElementIds.value.length === 1 && !selectedGroupId.value) {
+            selectedAnnotationId.value = null
+            syncPrimarySelectionStyle(id)
+            return
+        }
+        setElementSelection([id], null)
+    }
+
+    function enterGroupIsolation(elementId: string): boolean {
+        const el = currentPage.value?.elements.find((e) => e.id === elementId && !e.isDeleted)
+        if (!el?.groupId) return false
+        isolationGroupId.value = el.groupId
+        setElementSelection([elementId], null)
+        return true
+    }
+
+    function exitGroupIsolation() {
+        if (!isolationGroupId.value) return false
+        const gid = isolationGroupId.value
+        isolationGroupId.value = null
+        // 退出后选中整组（若仍有成员）
+        const memberIds = getGroupMemberIds(gid)
+        if (memberIds.length >= 2) {
+            setElementSelection(memberIds, gid)
+        }
+        return true
+    }
+
+    function groupSelectedElements(): boolean {
+        const page = currentPage.value
+        if (!page || !canGroupSelected.value) return false
+        const paths = selectedElementIds.value
+            .map((id) => page.elements.find((e) => e.id === id && !e.isDeleted))
+            .filter((e): e is ElementData => !!e && e.type === 'PATH')
+        if (paths.length < 2) return false
+
+        const newGid = `grp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+        for (const el of paths) {
+            el.groupId = newGid
+        }
+        pruneDegenerateGroups(currentPageIndex.value)
+        isolationGroupId.value = null
+        setElementSelection(paths.map((e) => e.id), newGid)
+        saveToHistory()
+        return true
+    }
+
+    function ungroupSelectedElements(): boolean {
+        const page = currentPage.value
+        if (!page || !canUngroupSelected.value) return false
+        const gid = selectedGroupId.value ?? selectedElement.value?.groupId
+        if (!gid) return false
+        const members = getGroupMembers(gid)
+        if (members.length === 0) return false
+        for (const el of members) {
+            delete el.groupId
+        }
+        if (isolationGroupId.value === gid) isolationGroupId.value = null
+        setElementSelection(members.map((e) => e.id), null)
+        saveToHistory()
+        return true
+    }
+
+    /** 元素剪贴板（会话内；支持多选 / 编组一起复制） */
+    const elementClipboard = ref<ElementData[]>([])
+    /** 连续粘贴时累加偏移 */
+    let pasteGeneration = 0
+
+    const COPYABLE_ELEMENT_TYPES = ['TEXT', 'IMAGE', 'PATH'] as const
+
+    const canCopySelectedElements = computed(() => {
+        const page = currentPage.value
+        if (!page || selectedElementIds.value.length === 0) return false
+        return selectedElementIds.value.some((id) => {
+            const el = page.elements.find((e) => e.id === id && !e.isDeleted)
+            return !!el && (COPYABLE_ELEMENT_TYPES as readonly string[]).includes(el.type)
+        })
+    })
+
+    const canPasteElements = computed(() => elementClipboard.value.length > 0)
+
+    /**
+     * 复制当前选中元素到剪贴板。
+     * 选择工具选中整组时 selectedElementIds 已含全部成员，会一并复制并保留组关系。
+     */
+    function copySelectedElements(): { ok: boolean; count: number } {
+        const page = currentPage.value
+        if (!page || !canCopySelectedElements.value) return { ok: false, count: 0 }
+        const copies: ElementData[] = []
+        for (const id of selectedElementIds.value) {
+            const el = page.elements.find((e) => e.id === id && !e.isDeleted)
+            if (!el || !(COPYABLE_ELEMENT_TYPES as readonly string[]).includes(el.type)) continue
+            const clone = JSON.parse(JSON.stringify(el)) as ElementData
+            // 复制前将页坐标 PATH 规范化为局部坐标，避免粘贴后几何错位
+            if (clone.type === 'PATH') {
+                const normalized = normalizeElementPathIfNeeded(clone)
+                if (normalized) {
+                    clone.pathData = normalized.pathData
+                    clone.x = normalized.x
+                    clone.y = normalized.y
+                    clone.width = normalized.width
+                    clone.height = normalized.height
+                    clone.pathLocalCoords = true
+                }
+            }
+            copies.push(clone)
+        }
+        if (copies.length === 0) return { ok: false, count: 0 }
+        elementClipboard.value = copies
+        pasteGeneration = 0
+        return { ok: true, count: copies.length }
+    }
+
+    /**
+     * 粘贴剪贴板元素到当前页。
+     * 新 id、isNew；同组映射新 groupId；默认偏移 5mm×粘贴次数。
+     */
+    function pasteClipboardElements(opts?: { offsetMm?: number }): { ok: boolean; count: number } {
+        const page = currentPage.value
+        if (!page || elementClipboard.value.length === 0) return { ok: false, count: 0 }
+
+        pasteGeneration += 1
+        const step = opts?.offsetMm ?? 5
+        const offset = step * pasteGeneration
+        const groupMap = new Map<string, string>()
+        const newIds: string[] = []
+
+        for (let i = 0; i < elementClipboard.value.length; i++) {
+            const src = elementClipboard.value[i]
+            const clone = JSON.parse(JSON.stringify(src)) as ElementData
+            clone.id = newElementId(clone.type === 'PATH' ? 'path' : clone.type === 'TEXT' ? 'tw' : 'img', page.elements.length + i)
+            delete clone.xmlObjId
+            clone.isNew = true
+            clone.isDirty = true
+            clone.isDeleted = false
+
+            if (clone.type === 'PATH' && clone.pathData) {
+                const normalized = normalizeElementPathIfNeeded(clone)
+                if (normalized) {
+                    clone.pathData = normalized.pathData
+                    clone.x = normalized.x
+                    clone.y = normalized.y
+                    clone.width = normalized.width
+                    clone.height = normalized.height
+                    clone.pathLocalCoords = true
+                }
+                if (clone.pathLocalCoords) {
+                    clone.x = (clone.x ?? 0) + offset
+                    clone.y = (clone.y ?? 0) + offset
+                } else {
+                    // 兜底：页坐标路径同时平移 pathData 与 Boundary
+                    clone.pathData = translateSvgPath(clone.pathData, offset, offset)
+                    clone.x = (clone.x ?? 0) + offset
+                    clone.y = (clone.y ?? 0) + offset
+                }
+            } else {
+                clone.x = (clone.x ?? 0) + offset
+                clone.y = (clone.y ?? 0) + offset
+            }
+
+            clone.originalX = clone.x
+            clone.originalY = clone.y
+            clone.originalWidth = clone.width
+            clone.originalHeight = clone.height
+            clone.originalRotation = clone.rotation ?? 0
+
+            if (clone.groupId) {
+                let ng = groupMap.get(clone.groupId)
+                if (!ng) {
+                    ng = `grp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+                    groupMap.set(clone.groupId, ng)
+                }
+                clone.groupId = ng
+            } else {
+                delete clone.groupId
+            }
+
+            page.elements.push(clone)
+            newIds.push(clone.id)
+        }
+
+        // 仅当「全部」粘贴项同属一个组时才视为整组选中（避免组+散件被误当成整组）
+        let sharedGroupId: string | null = null
+        if (newIds.length > 1) {
+            const gids = newIds
+                .map((id) => page.elements.find((e) => e.id === id)?.groupId)
+                .filter((g): g is string => !!g)
+            const unique = new Set(gids)
+            if (unique.size === 1 && gids.length === newIds.length) {
+                sharedGroupId = [...unique][0]
+            }
+        }
+
+        isolationGroupId.value = null
+        selectedAnnotationId.value = null
+        setElementSelection(newIds, sharedGroupId)
+        if (currentTool.value !== 'SELECT' && currentTool.value !== 'DIRECT_SELECT') {
+            currentTool.value = 'SELECT'
+        }
+        saveToHistory()
+        schedulePageThumbnailRefresh(currentPageIndex.value, 300)
+        return { ok: true, count: newIds.length }
+    }
+
+    /** 原地复制：复制当前选中并立即粘贴一份 */
+    function duplicateSelectedElements(): { ok: boolean; count: number } {
+        const copied = copySelectedElements()
+        if (!copied.ok) return { ok: false, count: 0 }
+        return pasteClipboardElements()
+    }
     function setScale(val: number) {
         scale.value = Math.max(0.25, Math.min(3, val))
     }
@@ -1547,7 +2127,8 @@ export const useEditorStore = defineStore('editor', () => {
     function updateElement(
         pageIndex: number,
         elementId: string,
-        changes: Partial<ElementData>
+        changes: Partial<ElementData>,
+        opts?: { skipHistory?: boolean },
     ) {
         if (!document.value) return
         const page = document.value.pages[pageIndex]
@@ -1565,6 +2146,20 @@ export const useEditorStore = defineStore('editor', () => {
 
         Object.assign(element, next)
         clearTextItemsCache()
+        if (!opts?.skipHistory) saveToHistory()
+        schedulePageThumbnailRefresh(pageIndex)
+    }
+
+    /** 批量更新元素（整组变换时只记一条历史） */
+    function updateElementsBatch(
+        pageIndex: number,
+        updates: Array<{ id: string; changes: Partial<ElementData> }>,
+    ) {
+        if (!document.value || updates.length === 0) return
+        for (let i = 0; i < updates.length; i++) {
+            const u = updates[i]
+            updateElement(pageIndex, u.id, u.changes, { skipHistory: true })
+        }
         saveToHistory()
         schedulePageThumbnailRefresh(pageIndex)
     }
@@ -1578,7 +2173,12 @@ export const useEditorStore = defineStore('editor', () => {
 
         if (element.isNew) {
             page!.elements.splice(idx, 1)
-            if (selectedElementId.value === elementId) selectedElementId.value = null
+            if (selectedElementIds.value.includes(elementId)) {
+                const next = selectedElementIds.value.filter((id) => id !== elementId)
+                if (next.length === 0) clearElementSelection()
+                else setElementSelection(next, null)
+            }
+            pruneDegenerateGroups(pageIndex)
             saveToHistory()
             schedulePageThumbnailRefresh(pageIndex)
             return
@@ -1599,7 +2199,11 @@ export const useEditorStore = defineStore('editor', () => {
      * - 新插入未保存的元素（isNew）：直接从列表移除，无需后端
      * - 已有 OFD 元素：标记 isDeleted（+isDirty），保留在列表里，保存时由后端移除原节点
      */
-    function deleteElement(pageIndex: number, elementId: string): boolean {
+    function deleteElement(
+        pageIndex: number,
+        elementId: string,
+        opts?: { skipHistory?: boolean },
+    ): boolean {
         if (!document.value) return false
         const page = document.value.pages[pageIndex]
         const idx = page?.elements.findIndex((e) => e.id === elementId) ?? -1
@@ -1612,16 +2216,31 @@ export const useEditorStore = defineStore('editor', () => {
             element.isDeleted = true
             element.isDirty = true
         }
-        if (selectedElementId.value === elementId) selectedElementId.value = null
+        if (selectedElementIds.value.includes(elementId)) {
+            const next = selectedElementIds.value.filter((id) => id !== elementId)
+            if (next.length === 0) clearElementSelection()
+            else setElementSelection(next, selectedGroupId.value && next.length > 1 ? selectedGroupId.value : null)
+        }
+        pruneDegenerateGroups(pageIndex)
+        if (selectedGroupId.value && getGroupMemberIds(selectedGroupId.value, pageIndex).length < 2) {
+            selectedGroupId.value = null
+        }
         clearTextItemsCache()
-        saveToHistory()
+        if (!opts?.skipHistory) saveToHistory()
         schedulePageThumbnailRefresh(pageIndex)
         return true
     }
 
     function deleteSelectedElement(): boolean {
-        if (!selectedElementId.value) return false
-        return deleteElement(currentPageIndex.value, selectedElementId.value)
+        if (selectedElementIds.value.length === 0) return false
+        const pageIndex = currentPageIndex.value
+        const ids = [...selectedElementIds.value]
+        let ok = false
+        for (const id of ids) {
+            if (deleteElement(pageIndex, id, { skipHistory: true })) ok = true
+        }
+        if (ok) saveToHistory()
+        return ok
     }
 
     function insertPage(position: number) {
@@ -1637,6 +2256,7 @@ export const useEditorStore = defineStore('editor', () => {
         document.value.pageCount += 1
         document.value.pages.forEach((p, i) => { p.pageIndex = i })
         remapAnnotationsAfterInsert(position, [])
+        remapGuidesAfterInsert(position)
         shiftThumbnailsAfterInsert(position)
         if (currentPageIndex.value >= position) {
             currentPageIndex.value += 1
@@ -1650,6 +2270,7 @@ export const useEditorStore = defineStore('editor', () => {
         document.value.pageCount -= 1
         document.value.pages.forEach((p, i) => { p.pageIndex = i })
         remapAnnotationsAfterDelete(pageIndex)
+        remapGuidesAfterDelete(pageIndex)
         if (currentPageIndex.value >= pageIndex) {
             currentPageIndex.value = Math.max(0, currentPageIndex.value - 1)
         }
@@ -1670,6 +2291,7 @@ export const useEditorStore = defineStore('editor', () => {
         pages.splice(toIndex, 0, page)
         pages.forEach((p, i) => { p.pageIndex = i })
         remapAnnotationsAfterMove(fromIndex, toIndex)
+        remapGuidesAfterMove(fromIndex, toIndex)
         remapPageThumbnails(buildOrderAfterMove(fromIndex, toIndex, n))
         adjustCurrentPageAfterMove(fromIndex, toIndex)
         saveToHistory()
@@ -1684,6 +2306,10 @@ export const useEditorStore = defineStore('editor', () => {
         const oldAnns: Record<number, AnnotationData[]> = {}
         for (const key of Object.keys(annotationsMap)) {
             oldAnns[Number(key)] = [...(annotationsMap[Number(key)] ?? [])]
+        }
+        const oldGuides: Record<number, GuideLine[]> = {}
+        for (const key of Object.keys(guidesMap)) {
+            oldGuides[Number(key)] = [...(guidesMap[Number(key)] ?? [])]
         }
 
         document.value.pages = newOrder.map((oldIdx, newIdx) => ({
@@ -1700,6 +2326,11 @@ export const useEditorStore = defineStore('editor', () => {
                 ...a,
                 pageIndex: newIdx,
             }))
+        }
+
+        clearGuidesMap()
+        for (let newIdx = 0; newIdx < n; newIdx++) {
+            guidesMap[newIdx] = [...(oldGuides[newOrder[newIdx]] ?? [])]
         }
 
         const oldCur = currentPageIndex.value
@@ -1742,6 +2373,11 @@ export const useEditorStore = defineStore('editor', () => {
         })
 
         remapAnnotationsAfterInsert(position, copiedAnns)
+        const srcGuidesSnapshot = [...(guidesMap[sourceIndex] ?? [])]
+        remapGuidesAfterInsert(position)
+        if (srcGuidesSnapshot.length > 0) {
+            guidesMap[position] = srcGuidesSnapshot.map((g) => makeGuide(g.orientation, g.positionMm))
+        }
         shiftThumbnailsAfterInsert(position, sourceIndex)
 
         if (fileId.value && copiedAnns.length > 0) {
@@ -1758,7 +2394,8 @@ export const useEditorStore = defineStore('editor', () => {
         }
 
         currentPageIndex.value = position
-        selectedElementId.value = null
+        clearElementSelection()
+        isolationGroupId.value = null
         selectedAnnotationId.value = null
         saveToHistory()
         return position
@@ -1967,7 +2604,8 @@ export const useEditorStore = defineStore('editor', () => {
         applyRepliesMap(entry.annotationReplies ?? {})
         const maxPage = Math.max(0, (document.value?.pageCount ?? 1) - 1)
         currentPageIndex.value = Math.min(Math.max(0, entry.currentPageIndex), maxPage)
-        selectedElementId.value = null
+        clearElementSelection()
+        isolationGroupId.value = null
         selectedAnnotationId.value = null
     }
 
@@ -2250,20 +2888,440 @@ export const useEditorStore = defineStore('editor', () => {
         return { ok: true }
     }
 
+    function setSkewPivotAnchor(index: number | null) {
+        skewPivotAnchorIndex.value = index
+    }
+
+    /** 当前选中 PATH 是否可做几何变换 */
+    const canTransformSelectedPath = computed(() => {
+        const el = getSelectedPathElement()
+        return !!(el && el.pathData?.trim() && !el.isDeleted)
+    })
+
+    function withSelectedPathModel(
+        mutator: (
+            model: ReturnType<typeof parsePathModel>,
+            el: ElementData,
+        ) => ReturnType<typeof parsePathModel> | null,
+        failMessage = '变换失败',
+    ): { ok: boolean; message?: string } {
+        ensureSelectedPathNormalized()
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) {
+            return { ok: false, message: '请先选中一条 PATH' }
+        }
+        if (found.pageIndex !== currentPageIndex.value) {
+            currentPageIndex.value = found.pageIndex
+        }
+        const el = found.element
+        const model = parsePathModel(el.pathData)
+        const next = mutator(model, el)
+        if (!next) return { ok: false, message: failMessage }
+        const baked = rebakeLocalPath(next, el.x, el.y)
+        updateElement(found.pageIndex, el.id, baked)
+        clearPathAnchorSelection()
+        skewPivotAnchorIndex.value = null
+        return { ok: true }
+    }
+
+    /** 水平=上下翻转；垂直=左右翻转 */
+    function mirrorSelectedPath(axis: 'horizontal' | 'vertical'): { ok: boolean; message?: string } {
+        return withSelectedPathModel((model) => {
+            const c = getPathCenter(model)
+            return mirrorPathModel(model, axis, c.x, c.y)
+        })
+    }
+
+    /** 将 PATH 缩放到目标宽高（局部几何），可选等比 */
+    function scaleSelectedPathToSize(
+        widthMm: number,
+        heightMm: number,
+        opts?: { uniform?: boolean },
+    ): { ok: boolean; message?: string } {
+        const w = Math.max(0.1, widthMm)
+        const h = Math.max(0.1, heightMm)
+        return withSelectedPathModel((model) => {
+            const b = getPathBounds(model)
+            if (b.width < 1e-6 || b.height < 1e-6) return null
+            let sx = w / b.width
+            let sy = h / b.height
+            const uniform = opts?.uniform ?? vectorUniformScale.value
+            if (uniform) {
+                const s = Math.min(sx, sy)
+                sx = s
+                sy = s
+            }
+            const c = getPathCenter(model)
+            return scalePathModelAbout(model, c.x, c.y, sx, sy)
+        })
+    }
+
+    /**
+     * 绕路径中心几何旋转（写入 pathData，不改 element.rotation）。
+     * `copy=true` 时等价于 rotateCopySelectedPath({ angleDeg, scale: 1, count: 1 })。
+     */
+    function rotateSelectedPathAroundCenter(
+        angleDeg: number,
+        opts?: { copy?: boolean },
+    ): { ok: boolean; message?: string; count?: number } {
+        if (!Number.isFinite(angleDeg) || Math.abs(angleDeg) < 1e-9) {
+            return { ok: false, message: '旋转角度无效' }
+        }
+        if (opts?.copy) {
+            return rotateCopySelectedPath({ angleDeg, scale: 1, count: 1 })
+        }
+        const res = withSelectedPathModel((model) => {
+            const c = getPathCenter(model)
+            return rotatePathModel(model, c.x, c.y, angleDeg)
+        })
+        return res.ok ? { ...res, count: 1 } : res
+    }
+
+    /**
+     * 旋转复制：相对当前 PATH，连续生成 count 份副本。
+     * 第 i 份相对原图：旋转 i×angleDeg，缩放 scale^i（绕路径中心）。
+     * scale=1 时仅旋转；count=1 时只复制一份。
+     */
+    function rotateCopySelectedPath(opts: {
+        angleDeg: number
+        /** 每步相对缩放，1=不缩放；0.9=每份缩小到 90% */
+        scale?: number
+        /** 复制份数，默认 1，上限 36 */
+        count?: number
+    }): { ok: boolean; message?: string; count?: number } {
+        const angleDeg = opts.angleDeg
+        const scale = opts.scale ?? 1
+        const count = Math.max(1, Math.min(36, Math.round(opts.count ?? 1)))
+
+        if (!Number.isFinite(angleDeg) || Math.abs(angleDeg) < 1e-9) {
+            return { ok: false, message: '旋转角度无效' }
+        }
+        if (!Number.isFinite(scale) || scale <= 0.05 || scale > 20) {
+            return { ok: false, message: '缩放比例需在 5%～2000% 之间' }
+        }
+
+        ensureSelectedPathNormalized()
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) {
+            return { ok: false, message: '请先选中一条 PATH' }
+        }
+        const page = document.value?.pages[found.pageIndex]
+        if (!page) return { ok: false, message: '页面无效' }
+        if (found.pageIndex !== currentPageIndex.value) {
+            currentPageIndex.value = found.pageIndex
+        }
+
+        const src = found.element
+        const baseModel = parsePathModel(src.pathData)
+        if (baseModel.commands.length === 0) {
+            return { ok: false, message: '路径为空' }
+        }
+        const pivot = getPathCenter(baseModel)
+        const newIds: string[] = []
+
+        for (let i = 1; i <= count; i++) {
+            let model = baseModel
+            model = rotatePathModel(model, pivot.x, pivot.y, angleDeg * i)
+            const s = scale ** i
+            if (Math.abs(s - 1) > 1e-9) {
+                model = scalePathModelAbout(model, pivot.x, pivot.y, s, s)
+            }
+            const baked = rebakeLocalPath(model, src.x, src.y)
+            const clone = JSON.parse(JSON.stringify(src)) as ElementData
+            clone.id = newElementId('path', page.elements.length + i)
+            delete clone.xmlObjId
+            delete clone.groupId
+            clone.isNew = true
+            clone.isDirty = true
+            clone.isDeleted = false
+            clone.pathData = baked.pathData
+            clone.x = baked.x
+            clone.y = baked.y
+            clone.width = baked.width
+            clone.height = baked.height
+            clone.pathLocalCoords = true
+            clone.originalX = clone.x
+            clone.originalY = clone.y
+            clone.originalWidth = clone.width
+            clone.originalHeight = clone.height
+            clone.originalRotation = clone.rotation ?? 0
+            page.elements.push(clone)
+            newIds.push(clone.id)
+        }
+
+        isolationGroupId.value = null
+        selectedAnnotationId.value = null
+        clearPathAnchorSelection()
+        setElementSelection(newIds, null)
+        if (currentTool.value !== 'SELECT' && currentTool.value !== 'DIRECT_SELECT') {
+            currentTool.value = 'SELECT'
+        }
+        saveToHistory()
+        schedulePageThumbnailRefresh(found.pageIndex, 300)
+        return { ok: true, count: newIds.length }
+    }
+
+    /** 数值倾斜：角度制；正 shx 为向右倾 */
+    function skewSelectedPathByAngles(
+        horizontalDeg: number,
+        verticalDeg: number,
+    ): { ok: boolean; message?: string } {
+        const shx = Math.tan((horizontalDeg * Math.PI) / 180)
+        const shy = Math.tan((verticalDeg * Math.PI) / 180)
+        if (!Number.isFinite(shx) || !Number.isFinite(shy)) {
+            return { ok: false, message: '倾斜角度过大' }
+        }
+        return withSelectedPathModel((model) => {
+            const c = getPathCenter(model)
+            return skewPathModel(model, c.x, c.y, shx, shy)
+        })
+    }
+
+    function offsetSelectedPath(distanceMm: number): { ok: boolean; message?: string } {
+        if (!Number.isFinite(distanceMm) || Math.abs(distanceMm) < 1e-9) {
+            return { ok: false, message: '偏移距离无效' }
+        }
+        return withSelectedPathModel((model) => offsetPathModel(model, distanceMm))
+    }
+
+    function simplifySelectedPath(toleranceMm = 0.3): { ok: boolean; message?: string } {
+        const tol = Math.max(0.01, toleranceMm || 0.3)
+        return withSelectedPathModel((model) => simplifyPathModel(model, tol))
+    }
+
+    /** 弧形 / 拱形封套；bend ∈ [-1,1] */
+    function warpSelectedPathArc(
+        bend: number,
+        style: WarpArcStyle = 'arc',
+        horizontal = true,
+    ): { ok: boolean; message?: string } {
+        return withSelectedPathModel((model) => warpArcPathModel(model, bend, style, horizontal))
+    }
+
+    /** 轮廓化描边 → 可填充闭合路径，并开启填充、关闭原描边习惯 */
+    function outlineSelectedPathStroke(): { ok: boolean; message?: string } {
+        ensureSelectedPathNormalized()
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) {
+            return { ok: false, message: '请先选中一条 PATH' }
+        }
+        const el = found.element
+        const width = Math.max(0.1, el.lineWidth ?? vectorLineWidth.value ?? 0.4)
+        const outline = outlineStrokePathModel(parsePathModel(el.pathData), width)
+        if (!outline) return { ok: false, message: '轮廓化失败' }
+        const baked = rebakeLocalPath(outline, el.x, el.y)
+        updateElement(found.pageIndex, el.id, {
+            ...baked,
+            pathFillEnabled: true,
+            pathStrokeEnabled: false,
+            fillColor: el.strokeColor || el.fillColor || vectorStrokeColor.value || '#222222',
+        })
+        clearPathAnchorSelection()
+        return { ok: true }
+    }
+
+    function closeSelectedPath(): { ok: boolean; message?: string } {
+        return withSelectedPathModel((model) => {
+            if (isPathClosed(model)) return null
+            return closePathModel(model)
+        }, '路径已闭合')
+    }
+
+    function openSelectedPath(): { ok: boolean; message?: string } {
+        return withSelectedPathModel((model) => {
+            if (!isPathClosed(model)) return null
+            return openPathModel(model)
+        }, '路径未闭合')
+    }
+
+    function joinSelectedPathEnds(): { ok: boolean; message?: string } {
+        let fail = '连接失败'
+        const result = withSelectedPathModel((model) => {
+            const r = joinPathEnds(
+                model,
+                selectedAnchorIndices.value.length >= 2 ? selectedAnchorIndices.value : undefined,
+            )
+            if (!r.ok || !r.model) {
+                fail = r.message || fail
+                return null
+            }
+            return r.model
+        }, fail)
+        if (!result.ok) return { ok: false, message: fail }
+        return result
+    }
+
+    function breakSelectedPathAtAnchor(): { ok: boolean; message?: string } {
+        ensureSelectedPathNormalized()
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH' || !found.element.pathData) {
+            return { ok: false, message: '请先选中一条 PATH' }
+        }
+        if (selectedAnchorIndices.value.length !== 1) {
+            return { ok: false, message: '请选中恰好一个锚点以断开' }
+        }
+        const el = found.element
+        const page = document.value?.pages[found.pageIndex]
+        if (!page) return { ok: false, message: '页面无效' }
+        const r = breakPathAtAnchor(parsePathModel(el.pathData), selectedAnchorIndices.value[0])
+        if (!r.ok || !r.primary) return { ok: false, message: r.message || '断开失败' }
+
+        const bakedPrimary = rebakeLocalPath(r.primary, el.x, el.y)
+        updateElement(found.pageIndex, el.id, bakedPrimary, { skipHistory: true })
+
+        if (r.secondary) {
+            const bakedSec = rebakeLocalPath(r.secondary, el.x, el.y)
+            const clone = JSON.parse(JSON.stringify(el)) as ElementData
+            clone.id = newElementId('path', page.elements.length)
+            delete clone.xmlObjId
+            delete clone.groupId
+            clone.isNew = true
+            clone.isDirty = true
+            clone.isDeleted = false
+            Object.assign(clone, bakedSec)
+            clone.originalX = clone.x
+            clone.originalY = clone.y
+            clone.originalWidth = clone.width
+            clone.originalHeight = clone.height
+            page.elements.push(clone)
+            setElementSelection([el.id, clone.id], null)
+        }
+        clearPathAnchorSelection()
+        saveToHistory()
+        return { ok: true }
+    }
+
+    function beginFreeDistort(): { ok: boolean; message?: string } {
+        ensureSelectedPathNormalized()
+        const el = getSelectedPathElement()
+        if (!el?.pathData) return { ok: false, message: '请先选中一条 PATH' }
+        const model = parsePathModel(el.pathData)
+        freeDistortCorners.value = defaultDistortCorners(model)
+        freeDistortSnapshot.value = { pathData: el.pathData, x: el.x, y: el.y }
+        clearPathAnchorSelection()
+        return { ok: true }
+    }
+
+    function setFreeDistortCorner(index: 0 | 1 | 2 | 3, point: { x: number; y: number }, opts?: { preview?: boolean }) {
+        if (!freeDistortCorners.value || !freeDistortSnapshot.value) return
+        const next = [...freeDistortCorners.value] as FreeDistortCorners
+        next[index] = { x: point.x, y: point.y }
+        freeDistortCorners.value = next
+        const snap = freeDistortSnapshot.value
+        const distorted = freeDistortPathModel(parsePathModel(snap.pathData), next)
+        const baked = rebakeLocalPath(distorted, snap.x, snap.y)
+        const found = findElementById(selectedElementId.value)
+        if (!found) return
+        // 预览时保持 snapshot 的原点基准：需用 snapshot path 的 rebake
+        // 但 rebake 会改 x,y；连续预览应用在 snapshot 上正确
+        updateElement(found.pageIndex, found.element.id, baked, { skipHistory: true })
+        if (!opts?.preview) {
+            // commit handled separately
+        }
+    }
+
+    function previewFreeDistortFromCorners(corners: FreeDistortCorners) {
+        if (!freeDistortSnapshot.value) return
+        freeDistortCorners.value = corners
+        const snap = freeDistortSnapshot.value
+        const distorted = freeDistortPathModel(parsePathModel(snap.pathData), corners)
+        const baked = rebakeLocalPath(distorted, snap.x, snap.y)
+        const found = findElementById(selectedElementId.value)
+        if (!found) return
+        updateElement(found.pageIndex, found.element.id, baked, { skipHistory: true })
+    }
+
+    function commitFreeDistort() {
+        if (!freeDistortCorners.value || !freeDistortSnapshot.value) return
+        const snap = freeDistortSnapshot.value
+        const distorted = freeDistortPathModel(parsePathModel(snap.pathData), freeDistortCorners.value)
+        const baked = rebakeLocalPath(distorted, snap.x, snap.y)
+        const found = findElementById(selectedElementId.value)
+        if (!found) return
+        updateElement(found.pageIndex, found.element.id, baked)
+        // 更新 snapshot 为当前结果，便于继续拖
+        const el = found.element
+        freeDistortSnapshot.value = { pathData: el.pathData!, x: el.x, y: el.y }
+        freeDistortCorners.value = defaultDistortCorners(parsePathModel(el.pathData!))
+    }
+
+    function endFreeDistort() {
+        freeDistortCorners.value = null
+        freeDistortSnapshot.value = null
+        if (currentTool.value === 'VECTOR_FREE_DISTORT') {
+            currentTool.value = 'SELECT'
+        }
+    }
+
+    /**
+     * 倾斜预览/提交：从快照路径绕局部中心剪切后 rebake。
+     * skipHistory=true 用于拖拽过程；结束时再 commitSkewHistory。
+     */
+    function applySkewToSelectedPath(
+        snapshot: { pathData: string; x: number; y: number },
+        pivotLocal: { x: number; y: number },
+        shx: number,
+        shy: number,
+        opts?: { skipHistory?: boolean },
+    ): boolean {
+        const found = findElementById(selectedElementId.value)
+        if (!found || found.element.type !== 'PATH') return false
+        if (found.pageIndex !== currentPageIndex.value) {
+            currentPageIndex.value = found.pageIndex
+        }
+        const skewed = skewPathModel(
+            parsePathModel(snapshot.pathData),
+            pivotLocal.x,
+            pivotLocal.y,
+            shx,
+            shy,
+        )
+        const baked = rebakeLocalPath(skewed, snapshot.x, snapshot.y)
+        updateElement(found.pageIndex, found.element.id, baked, { skipHistory: opts?.skipHistory })
+        return true
+    }
+
     function setTool(tool: ToolType) {
         if (tool !== 'VECTOR_ARC') {
             lastArcSession.value = null
         }
         currentTool.value = tool
         selectedAnnotationId.value = null
-        if (tool !== 'SELECT' && tool !== 'DIRECT_SELECT') {
-            selectedElementId.value = null
-            clearPathAnchorSelection()
+        const keepSelection = tool === 'SELECT' || tool === 'DIRECT_SELECT' || tool === 'VECTOR_SKEW' || tool === 'VECTOR_FREE_DISTORT'
+        if (!keepSelection) {
+            clearElementSelection()
+            isolationGroupId.value = null
+        } else if (tool === 'DIRECT_SELECT' && selectedGroupId.value) {
+            const leafId = selectedElementId.value
+            const gid = selectedGroupId.value
+            if (leafId && gid) {
+                isolationGroupId.value = gid
+                setElementSelection([leafId], null)
+            }
+        }
+        if (tool === 'VECTOR_SKEW') {
+            skewPivotAnchorIndex.value = null
+            // 倾斜只作用单个 PATH：收成主选叶子，避免整组/多选误联动
+            const leafId = selectedElementId.value
+            if (leafId) {
+                setElementSelection([leafId], null)
+                ensureSelectedPathNormalized()
+            }
+        } else {
+            skewPivotAnchorIndex.value = null
+        }
+        if (tool === 'VECTOR_FREE_DISTORT') {
+            const r = beginFreeDistort()
+            if (!r.ok) {
+                currentTool.value = 'SELECT'
+            }
+        } else if (tool !== 'VECTOR_FREE_DISTORT') {
+            freeDistortCorners.value = null
+            freeDistortSnapshot.value = null
         }
         if (tool !== 'DIRECT_SELECT') {
             clearPathAnchorSelection()
         } else {
-            // 切入直接选择时，若已选中 PATH 则规范化并准备锚点
             const el = getSelectedPathElement()
             if (el) ensureSelectedPathNormalized()
         }
@@ -2273,7 +3331,8 @@ export const useEditorStore = defineStore('editor', () => {
         pendingStampImage.value = dataUrl
         currentTool.value = 'STAMP'
         selectedAnnotationId.value = null
-        selectedElementId.value = null
+        clearElementSelection()
+        isolationGroupId.value = null
     }
 
     function clearPendingStampImage() {
@@ -2295,7 +3354,7 @@ export const useEditorStore = defineStore('editor', () => {
     function selectAnnotation(id: string | null) {
         selectedAnnotationId.value = id
         if (id) {
-            selectedElementId.value = null
+            clearElementSelection()
             rightPanelTab.value = 'properties'
         }
     }
@@ -2697,6 +3756,7 @@ export const useEditorStore = defineStore('editor', () => {
     return {
         // ── 原有状态 ──
         document, currentPageIndex, pageViewMode, viewRotation, selectedElementId,
+        selectedElementIds, selectedGroupId, isolationGroupId,
         scale, isLoading, loadingText, loadingProgress, currentFile, documentSource, documentKind,
         history, historyIndex, fileId, renderVersion,
         printDialogVisible, exportPdfDialogVisible, shortcutsDialogVisible, openShortcutsDialog,
@@ -2706,8 +3766,12 @@ export const useEditorStore = defineStore('editor', () => {
         // ── 搜索 / 文本选择 ──
         searchVisible, searchQuery, searchMatches, searchActiveIndex, searching,
         textSelectMode, showReferenceGrid, referenceGridSpacingMm, searchMatchesByPage,
+        showRulers, showGuides, guidesLocked, guidesMap,
         openSearch, closeSearch, runSearch, nextMatch, prevMatch, jumpToMatch,
         toggleTextSelectMode, setShowReferenceGrid, toggleReferenceGrid, getPageTextItems,
+        setShowRulers, toggleRulers, setShowGuides, toggleGuides,
+        setGuidesLocked, toggleGuidesLocked, getPageGuides,
+        addGuide, updateGuidePosition, removeGuide, clearPageGuides, clearAllGuides,
         // ── 注释状态 ──
         currentTool, annotationsMap, annotationRepliesMap, discussionAuthor, selectedAnnotationId,
         rightPanelTab, annotationListScope, setAnnotationListScope,
@@ -2716,13 +3780,16 @@ export const useEditorStore = defineStore('editor', () => {
         annotationColor, annotationOpacity, annotationLineWidth,
         typewriterFontSizeMm, typewriterColor, typewriterFontFamily, typewriterBold, typewriterItalic,
         vectorStrokeColor, vectorFillColor, vectorLineWidth, vectorFillEnabled, vectorStrokeEnabled,
+        regularPolygonSides, setRegularPolygonSides, nudgeRegularPolygonSides,
         vectorDashPattern, vectorLineCap, vectorLineJoin,
         vectorUniformScale, pathCornerRadiusMm, lastArcSession,
         pendingStampImage, hasPendingStamp,
         pageThumbnails, thumbnailLoadingPages, thumbnailLoadedCount, isGeneratingThumbnails,
         // ── 原有计算属性 ──
-        currentPage, selectedElement, canDeleteSelectedElement, canUndo, canRedo, hasUnsavedChanges, isPdfDocument,
-        isHandTool, isSelectTool, isDirectSelectTool, isTypewriterTool, isVectorTool, isPolylineTool, isPenTool, isAnnotationTool,
+        currentPage, selectedElement, canDeleteSelectedElement, canGroupSelected, canUngroupSelected,
+        canCopySelectedElements, canPasteElements,
+        canUndo, canRedo, hasUnsavedChanges, isPdfDocument,
+        isHandTool, isSelectTool, isDirectSelectTool, isSkewTool, isFreeDistortTool, isTypewriterTool, isVectorTool, isPolylineTool, isPenTool, isAnnotationTool,
         // ── 注释计算属性 ──
         currentPageAnnotations, selectedAnnotation,
         // ── 原有方法 ──
@@ -2730,22 +3797,35 @@ export const useEditorStore = defineStore('editor', () => {
         registerScrollToPageInViewHook,
         registerExportCurrentPageImageHook, exportCurrentPageImage,
         registerExportPagesImageHook, exportPagesImage,
-        selectElement, ensureSelectedPathNormalized, setScale, fitToWidth, fitToPage,
+        selectElement, setElementSelection, clearElementSelection,
+        getGroupMembers, getGroupMemberIds, isElementInSelection,
+        enterGroupIsolation, exitGroupIsolation,
+        groupSelectedElements, ungroupSelectedElements,
+        copySelectedElements, pasteClipboardElements, duplicateSelectedElements,
+        ensureSelectedPathNormalized, setScale, fitToWidth, fitToPage,
         rotateViewClockwise, rotateViewCounterClockwise, resetViewRotation,
         rotateCurrentPagePersist,
         setWatermarkConfig, watermarkConfig,
         extractPagesAsBlob,
         registerEditorAreaResolver, setLoading, setLoadingProgress,
-        updateElement, resetElement, deleteElement, deleteSelectedElement,
+        updateElement, updateElementsBatch, resetElement, deleteElement, deleteSelectedElement,
         addTypewriterText, setTypewriterFontSizeMm, setTypewriterColor,
         setTypewriterFontFamily, setTypewriterBold, setTypewriterItalic, syncTypewriterStyleFromElement,
         applyTypewriterStyleToSelectedText,
-        addVectorShape, addVectorPolyline, addVectorFromPenKnots, addVectorArc, completeLastArcAsCircle, clearLastArcSession,
+        addVectorShape, addVectorPolyline, addVectorRegularPolygon, addVectorFromPenKnots, addVectorArc, completeLastArcAsCircle, clearLastArcSession,
         setVectorStrokeColor, setVectorFillColor, setVectorLineWidth,
         setVectorFillEnabled, setVectorStrokeEnabled, setVectorDashPattern, setVectorLineCap, setVectorLineJoin,
         setVectorUniformScale, setPathCornerRadiusMm,
         applyVectorStyleToSelectedPath, syncVectorStyleFromElement, applySaveElementSync,
         selectedAnchorIndices, clearPathAnchorSelection, setSelectedAnchors, togglePathAnchor,
+        skewPivotAnchorIndex, setSkewPivotAnchor, applySkewToSelectedPath,
+        canTransformSelectedPath, mirrorSelectedPath, scaleSelectedPathToSize,
+        rotateSelectedPathAroundCenter, rotateCopySelectedPath, skewSelectedPathByAngles,
+        offsetSelectedPath, simplifySelectedPath,
+        warpSelectedPathArc, outlineSelectedPathStroke,
+        closeSelectedPath, openSelectedPath, joinSelectedPathEnds, breakSelectedPathAtAnchor,
+        freeDistortCorners, freeDistortSnapshot, beginFreeDistort,
+        setFreeDistortCorner, previewFreeDistortFromCorners, commitFreeDistort, endFreeDistort,
         getPathAnchors, translateSelectedPathAnchors, insertPathAnchorAtLocalPoint, deleteSelectedPathAnchors,
         getPathHandles, movePathHandle, cycleSelectedAnchorSmoothMode,
         roundSelectedPathAnchors, roundAllSelectedPathCorners,

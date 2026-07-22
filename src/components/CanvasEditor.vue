@@ -4,12 +4,50 @@
       class="canvas-wrapper"
       :class="{
         'canvas-wrapper--offscreen': offscreen,
+        'canvas-wrapper--rulers': !offscreen && store.showRulers,
         'cursor-crosshair': !offscreen && (store.isAnnotationTool || store.isTypewriterTool || store.isVectorTool),
         'cursor-hand': !offscreen && store.isHandTool,
         'cursor-grabbing': !offscreen && store.isHandTool && isPanning,
         'cursor-direct': !offscreen && store.isDirectSelectTool,
+        'cursor-skew': !offscreen && store.isSkewTool,
       }"
   >
+    <!-- 标尺：从顶/左侧拖出水平/垂直参考线 -->
+    <template v-if="!offscreen && store.showRulers">
+      <div class="ruler-corner" aria-hidden="true" />
+      <div
+          class="ruler ruler-h"
+          title="向下拖出水平参考线"
+          @mousedown.prevent="onRulerMouseDown('h', $event)"
+      >
+        <span
+            v-for="t in rulerHTicks"
+            :key="'rh-' + t.mm"
+            class="ruler-tick"
+            :class="{ major: t.major }"
+            :style="{ left: t.px + 'px' }"
+        >
+          <i v-if="t.major && t.label" class="ruler-label">{{ t.label }}</i>
+        </span>
+      </div>
+      <div
+          class="ruler ruler-v"
+          title="向右拖出垂直参考线"
+          @mousedown.prevent="onRulerMouseDown('v', $event)"
+      >
+        <span
+            v-for="t in rulerVTicks"
+            :key="'rv-' + t.mm"
+            class="ruler-tick"
+            :class="{ major: t.major }"
+            :style="{ top: t.px + 'px' }"
+        >
+          <i v-if="t.major && t.label" class="ruler-label">{{ t.label }}</i>
+        </span>
+      </div>
+    </template>
+
+    <div class="stage-host">
     <v-stage
         ref="stageRef"
         :config="stageConfig"
@@ -38,6 +76,10 @@
               v-if="element.type === 'TEXT' && isCurrencySplitText(element)"
               :config="getCurrencyGroupConfig(element)"
               @click="handleElementClick($event, element.id)"
+              @dblclick="handleElementDblClick($event, element.id)"
+              @mousedown="(e: any) => handleElementMouseDown(e, element.id)"
+              @dragstart="(e: any) => handleDragStart(e, element.id)"
+              @dragmove="(e: any) => handleDragMove(e, element.id)"
               @dragend="(e: any) => handleDragEnd(e, element.id)"
               @transformend="(e: any) => handleTransformEnd(e, element.id)"
           >
@@ -48,6 +90,10 @@
               v-else-if="element.type === 'TEXT' && usesGlyphAdvances(element)"
               :config="getGlyphRunGroupConfig(element)"
               @click="handleElementClick($event, element.id)"
+              @dblclick="handleElementDblClick($event, element.id)"
+              @mousedown="(e: any) => handleElementMouseDown(e, element.id)"
+              @dragstart="(e: any) => handleDragStart(e, element.id)"
+              @dragmove="(e: any) => handleDragMove(e, element.id)"
               @dragend="(e: any) => handleDragEnd(e, element.id)"
               @transformend="(e: any) => handleTransformEnd(e, element.id)"
           >
@@ -61,6 +107,10 @@
               v-else-if="element.type === 'TEXT'"
               :config="getTextConfig(element)"
               @click="handleElementClick($event, element.id)"
+              @dblclick="handleElementDblClick($event, element.id)"
+              @mousedown="(e: any) => handleElementMouseDown(e, element.id)"
+              @dragstart="(e: any) => handleDragStart(e, element.id)"
+              @dragmove="(e: any) => handleDragMove(e, element.id)"
               @dragend="(e: any) => handleDragEnd(e, element.id)"
               @transformend="(e: any) => handleTransformEnd(e, element.id)"
           />
@@ -68,6 +118,10 @@
               v-else-if="element.type === 'PATH' && getPathData(element)"
               :config="getPathConfig(element)"
               @click="handleElementClick($event, element.id)"
+              @dblclick="handleElementDblClick($event, element.id)"
+              @mousedown="(e: any) => handleElementMouseDown(e, element.id)"
+              @dragstart="(e: any) => handleDragStart(e, element.id)"
+              @dragmove="(e: any) => handleDragMove(e, element.id)"
               @dragend="(e: any) => handleDragEnd(e, element.id)"
               @transformend="(e: any) => handleTransformEnd(e, element.id)"
           />
@@ -84,6 +138,10 @@
               :key="imageNodeKey(element)"
               :config="getImageConfig(element)"
               @click="handleElementClick($event, element.id)"
+              @dblclick="handleElementDblClick($event, element.id)"
+              @mousedown="(e: any) => handleElementMouseDown(e, element.id)"
+              @dragstart="(e: any) => handleDragStart(e, element.id)"
+              @dragmove="(e: any) => handleDragMove(e, element.id)"
               @dragend="(e: any) => handleDragEnd(e, element.id)"
               @transformend="(e: any) => handleTransformEnd(e, element.id)"
           />
@@ -91,21 +149,25 @@
               v-else-if="element.type === 'IMAGE' && getImageSrc(element) && !imageErrorMap[element.id]"
               :config="getImagePlaceholderConfig(element)"
               @click="handleElementClick($event, element.id)"
+              @dblclick="handleElementDblClick($event, element.id)"
           />
           <v-rect
               v-else-if="element.type === 'IMAGE' && imageErrorMap[element.id]"
               :config="getImageFailedConfig(element)"
               @click="handleElementClick($event, element.id)"
+              @dblclick="handleElementDblClick($event, element.id)"
           />
           <v-rect
               v-else-if="element.type === 'IMAGE'"
               :config="getImageNoSrcPlaceholderConfig(element)"
               @click="handleElementClick($event, element.id)"
+              @dblclick="handleElementDblClick($event, element.id)"
           />
           <v-rect
               v-else
               :config="getFallbackConfig(element)"
               @click="handleElementClick($event, element.id)"
+              @dblclick="handleElementDblClick($event, element.id)"
           />
         </template>
 
@@ -115,6 +177,22 @@
               v-for="(line, i) in referenceGridLineConfigs"
               :key="'grid-' + i"
               :config="line"
+          />
+        </template>
+
+        <!-- 参考线：可拖动；拖出页面删除 -->
+        <template v-if="!offscreen && (store.showGuides || draftGuide)">
+          <v-line
+              v-for="g in (store.showGuides ? guideLineConfigs : [])"
+              :key="g.id"
+              :config="g.config"
+              @dragmove="(e: any) => onGuideDragMove(e, g.id, g.orientation)"
+              @dragend="(e: any) => onGuideDragEnd(e, g.id, g.orientation)"
+              @dblclick="() => onGuideDblClick(g.id)"
+          />
+          <v-line
+              v-if="draftGuideConfig"
+              :config="draftGuideConfig"
           />
         </template>
 
@@ -275,8 +353,8 @@
             :config="previewVectorLineConfig"
         />
         <v-line
-            v-else-if="['VECTOR_POLYLINE', 'VECTOR_POLYGON'].includes(drawTool)"
-            :config="previewPolylineConfig"
+            v-else-if="drawTool === 'VECTOR_REGULAR_POLYGON'"
+            :config="previewRegularPolygonConfig"
         />
         <template v-else-if="drawTool === 'VECTOR_PEN' || penActive">
           <v-path :config="previewPenPathConfig" />
@@ -315,6 +393,12 @@
           <v-line :config="previewReplaceStrikeConfig" />
           <v-line :config="previewReplaceCaretConfig" />
         </v-group>
+        <!-- 折线/多边形预览独立挂载：避免结束后仍占 drawTool 分支导致二次绘制无轨迹 -->
+        <v-line
+            v-if="polylineActive"
+            :key="'polyline-preview-' + polylineSessionKey"
+            :config="previewPolylineConfig"
+        />
       </v-layer>
 
       <!-- ============================================================
@@ -330,7 +414,7 @@
         </template>
       </v-layer>
 
-      <!-- PATH 锚点 / 贝塞尔手柄编辑层：置于最顶，与 Transformer 互斥 -->
+      <!-- PATH 锚点 / 贝塞尔手柄 / 倾斜中心 -->
       <v-layer v-if="!offscreen && pathEditVisible">
         <v-line
             v-for="(seg, si) in pathEditSegmentHits"
@@ -355,18 +439,32 @@
             @dragmove="(e: any) => handleBezierHandleDragMove(e, h.id)"
             @dragend="(e: any) => handleBezierHandleDragEnd(e, h.id)"
         />
+        <!-- 倾斜中心十字准星 -->
+        <v-line
+            v-for="(line, li) in skewPivotCrossConfigs"
+            :key="'skew-cross-' + li"
+            :config="line"
+        />
+        <v-circle
+            v-for="c in freeDistortCornerConfigs"
+            :key="'fd-' + c.index"
+            :config="c.config"
+            @dragmove="(e: any) => onFreeDistortCornerDragMove(e, c.index)"
+            @dragend="(e: any) => onFreeDistortCornerDragEnd(e, c.index)"
+        />
         <v-circle
             v-for="a in pathEditAnchorConfigs"
             :key="'anc-' + a.id"
             :config="a.config"
-            @mousedown="(e: any) => handleAnchorMouseDown(e, a.index)"
+            @mousedown="(e: any) => onPathAnchorMouseDown(e, a.index)"
             @dragmove="(e: any) => handleAnchorDragMove(e, a.index)"
             @dragend="(e: any) => handleAnchorDragEnd(e, a.index)"
-            @click="(e: any) => handleAnchorClick(e, a.index)"
+            @click="(e: any) => onPathAnchorClick(e, a.index)"
             @dblclick="(e: any) => handleAnchorDblClick(e, a.index)"
         />
       </v-layer>
     </v-stage>
+    </div>
 
     <!-- ============================================================
          文本选择层：透明可选中文本（仅视图未旋转、文本选择模式开启时）
@@ -423,7 +521,7 @@ import type { PageData, ElementData, AnnotationData } from '@/types'
 import { effectivePageSizeMm, konvaStageRotationConfig, normalizeViewRotation } from '@/utils/viewRotation'
 import { renderPdfPage, type PageTextItem } from '@/utils/pdfRender'
 import { buildSquigglyRelativePoints, relativePointsToKonva } from '@/utils/markupPath'
-import { scaleLocalPath, translateSvgPath, circleBoundsFromDrag, buildSemicirclePathPage, type ArcSign } from '@/utils/pathShape'
+import { scaleLocalPath, translateSvgPath, circleBoundsFromDrag, buildSemicirclePathPage, regularPolygonVertices, type ArcSign } from '@/utils/pathShape'
 import {
   extractAnchors,
   extractHandles,
@@ -440,7 +538,8 @@ import { lineHeightRatio, normalizeTextAlign } from '@/utils/textLayout'
 import { buildOfdFontStack } from '@/utils/ofdFont'
 import { usesGlyphAdvances, glyphCharOffsetMm } from '@/utils/ofdGlyphText'
 import LinkActionDialog from '@/components/LinkActionDialog.vue'
-import type { LinkActionType } from '@/types'
+import type { LinkActionType, GuideOrientation } from '@/types'
+import { RULER_SIZE_PX, isGuideOffPage } from '@/utils/guides'
 
 // ─────────────────────────────────────────────
 // Props / Store
@@ -495,10 +594,15 @@ const showTextLayer = computed(() =>
     && textLayerItems.value.length > 0,
 )
 
-const textLayerStyle = computed(() => ({
-  width: `${props.page.width * MM_TO_PX * renderScale.value}px`,
-  height: `${props.page.height * MM_TO_PX * renderScale.value}px`,
-}))
+const textLayerStyle = computed(() => {
+  const pad = (!props.offscreen && store.showRulers) ? RULER_SIZE_PX : 0
+  return {
+    width: `${props.page.width * MM_TO_PX * renderScale.value}px`,
+    height: `${props.page.height * MM_TO_PX * renderScale.value}px`,
+    left: `${pad}px`,
+    top: `${pad}px`,
+  }
+})
 
 function textSpanStyle(it: PageTextItem) {
   const sc = MM_TO_PX * renderScale.value
@@ -684,6 +788,137 @@ const referenceGridLineConfigs = computed(() => {
 })
 
 // ─────────────────────────────────────────────
+// 参考线 + 标尺
+// ─────────────────────────────────────────────
+const pageGuides = computed(() => store.getPageGuides(props.pageIndex))
+
+const guideLineConfigs = computed(() => {
+  const locked = store.guidesLocked
+  return pageGuides.value.map((g) => {
+    const isH = g.orientation === 'h'
+    return {
+      id: g.id,
+      orientation: g.orientation,
+      config: {
+        id: `guide-${g.id}`,
+        name: `guide-line guide-${g.orientation}`,
+        points: isH
+            ? [0, 0, canvasWidth.value, 0]
+            : [0, 0, 0, canvasHeight.value],
+        x: isH ? 0 : s(g.positionMm),
+        y: isH ? s(g.positionMm) : 0,
+        stroke: '#e11d48',
+        strokeWidth: 1,
+        dash: [6, 4],
+        hitStrokeWidth: 10,
+        listening: !locked,
+        draggable: !locked,
+        dragBoundFunc: (pos: { x: number; y: number }) => (
+          isH ? { x: 0, y: pos.y } : { x: pos.x, y: 0 }
+        ),
+      },
+    }
+  })
+})
+
+const draftGuide = ref<{ orientation: GuideOrientation; positionMm: number } | null>(null)
+
+const draftGuideConfig = computed(() => {
+  const d = draftGuide.value
+  if (!d) return null
+  const isH = d.orientation === 'h'
+  return {
+    name: 'guide-draft',
+    points: isH
+        ? [0, 0, canvasWidth.value, 0]
+        : [0, 0, 0, canvasHeight.value],
+    x: isH ? 0 : s(d.positionMm),
+    y: isH ? s(d.positionMm) : 0,
+    stroke: 'rgba(225, 29, 72, 0.55)',
+    strokeWidth: 1,
+    dash: [4, 4],
+    listening: false,
+  }
+})
+
+type RulerTick = { mm: number; px: number; major: boolean; label?: string }
+
+function buildRulerTicks(lengthMm: number): RulerTick[] {
+  const spacing = Math.max(1, store.referenceGridSpacingMm || 5)
+  const majorEvery = spacing >= 10 ? 1 : 2
+  const ticks: RulerTick[] = []
+  let i = 0
+  for (let mm = 0; mm <= lengthMm + 1e-6; mm += spacing, i++) {
+    const major = i % majorEvery === 0
+    ticks.push({
+      mm,
+      px: s(mm),
+      major,
+      label: major ? String(Math.round(mm)) : undefined,
+    })
+  }
+  return ticks
+}
+
+const rulerHTicks = computed(() => buildRulerTicks(props.page.width))
+const rulerVTicks = computed(() => buildRulerTicks(props.page.height))
+
+function onRulerMouseDown(orientation: GuideOrientation, ev: MouseEvent) {
+  if (store.guidesLocked) {
+    ElMessage.info({ message: '参考线已锁定', duration: 1200, showClose: false })
+    return
+  }
+  ensureActivePageForInteraction()
+  const pos = getStagePosFromClient(ev)
+  if (!pos) return
+  const positionMm = orientation === 'h' ? pos.y : pos.x
+  draftGuide.value = { orientation, positionMm }
+  const onMove = (e: MouseEvent) => {
+    const p = getStagePosFromClient(e)
+    if (!p) return
+    draftGuide.value = {
+      orientation,
+      positionMm: orientation === 'h' ? p.y : p.x,
+    }
+  }
+  const onUp = (e: MouseEvent) => {
+    window.removeEventListener('mousemove', onMove)
+    window.removeEventListener('mouseup', onUp)
+    const p = getStagePosFromClient(e)
+    const raw = draftGuide.value
+    draftGuide.value = null
+    if (!raw || !p) return
+    const positionMm = orientation === 'h' ? p.y : p.x
+    const pageSize = orientation === 'h' ? props.page.height : props.page.width
+    if (isGuideOffPage(positionMm, pageSize)) return
+    store.addGuide(props.pageIndex, orientation, positionMm)
+  }
+  window.addEventListener('mousemove', onMove)
+  window.addEventListener('mouseup', onUp)
+}
+
+function onGuideDragMove(_e: any, _id: string, _orientation: GuideOrientation) {
+  // 位置在 dragend 写回；拖动中 Konva 自行更新节点
+}
+
+function onGuideDragEnd(e: any, id: string, orientation: GuideOrientation) {
+  const node = e.target
+  const posMm = orientation === 'h' ? px2mm(node.y()) : px2mm(node.x())
+  const pageSize = orientation === 'h' ? props.page.height : props.page.width
+  suppressClick.value = true
+  if (isGuideOffPage(posMm, pageSize)) {
+    store.removeGuide(props.pageIndex, id)
+    return
+  }
+  store.updateGuidePosition(props.pageIndex, id, posMm)
+}
+
+function onGuideDblClick(id: string) {
+  if (store.guidesLocked) return
+  store.removeGuide(props.pageIndex, id)
+}
+
+// ─────────────────────────────────────────────
 // 原生 PDF 背景（PDF.js）
 // ─────────────────────────────────────────────
 const pdfBgCanvas = ref<HTMLCanvasElement | null>(null)
@@ -777,6 +1012,9 @@ function cancelPolylineDraw() {
   polylinePoints.value = []
   polylineCursor.value = null
   stopPolylineSession()
+  if (drawTool.value === 'VECTOR_POLYLINE' || drawTool.value === 'VECTOR_POLYGON') {
+    drawTool.value = ''
+  }
 }
 
 async function finishPolylineDraw(forceClosed?: boolean) {
@@ -794,7 +1032,8 @@ async function finishPolylineDraw(forceClosed?: boolean) {
   cancelPolylineDraw()
   await waitForKonvaSettle()
   store.addVectorPolyline(props.pageIndex, pts, closed)
-  store.setTool('SELECT')
+  // 取消选中，避免 Transformer 挡住下一次落点
+  store.selectElement(null)
 }
 
 function onPolylineKeydown(e: KeyboardEvent) {
@@ -810,10 +1049,25 @@ function onPolylineKeydown(e: KeyboardEvent) {
     }
     return
   }
+  // 正多边形：工具激活或拖拽中可用 ↑↓ / [ ] 调边数
+  if (store.currentTool === 'VECTOR_REGULAR_POLYGON') {
+    if (e.key === 'ArrowUp' || e.key === ']') {
+      e.preventDefault()
+      const n = store.nudgeRegularPolygonSides(1)
+      ElMessage.success({ message: `边数 ${n}`, duration: 600, showClose: false })
+      return
+    }
+    if (e.key === 'ArrowDown' || e.key === '[') {
+      e.preventDefault()
+      const n = store.nudgeRegularPolygonSides(-1)
+      ElMessage.success({ message: `边数 ${n}`, duration: 600, showClose: false })
+      return
+    }
+  }
   if (!polylineActive.value) return
   if (e.key === 'Enter') {
     e.preventDefault()
-    void finishPolylineDraw(false)
+    void finishPolylineDraw(store.currentTool === 'VECTOR_POLYGON')
   } else if (e.key === 'Escape') {
     e.preventDefault()
     cancelPolylineDraw()
@@ -1157,29 +1411,70 @@ watch(
 // ─────────────────────────────────────────────
 // OFD 元素 Transformer 跟踪
 // ─────────────────────────────────────────────
-async function refreshElementTransformer(elementId: string) {
+async function refreshElementTransformer(elementId?: string | null) {
   await nextTick()
   const transformer = transformerRef.value?.getNode()
   const stage       = stageRef.value?.getNode()
-  if (!transformer || !stage || store.selectedElementId !== elementId) return
-  const node = stage.findOne('#' + elementId)
-  if (node) {
-    transformer.nodes([node])
-    transformer.getLayer()?.batchDraw()
+  if (!transformer || !stage || !store.isSelectTool) return
+
+  // 单选刷新时若主选已变则跳过，避免竞态
+  if (
+    elementId
+    && store.selectedElementIds.length <= 1
+    && !store.selectedGroupId
+    && store.selectedElementId !== elementId
+  ) {
+    return
   }
+
+  const ids = store.selectedGroupId
+    ? store.getGroupMemberIds(store.selectedGroupId)
+    : (store.selectedElementIds.length > 0
+        ? [...store.selectedElementIds]
+        : (elementId ? [elementId] : []))
+
+  const nodes = ids
+    .map((id) => stage.findOne('#' + id))
+    .filter((n: any) => !!n)
+
+  transformer.nodes(nodes)
+  transformer.getLayer()?.batchDraw()
 }
 
-watch(() => store.selectedElementId, async (id) => {
-  if (props.offscreen) return
-  if (id && store.isSelectTool) await refreshElementTransformer(id)
-  else {
+watch(
+  () => [store.selectedElementId, store.selectedElementIds.join(','), store.selectedGroupId] as const,
+  async () => {
+    if (props.offscreen) return
+    if (store.isSelectTool && (store.selectedElementId || store.selectedElementIds.length > 0)) {
+      await refreshElementTransformer(store.selectedElementId)
+    } else {
+      await nextTick()
+      const transformer = transformerRef.value?.getNode()
+      if (!transformer) return
+      transformer.nodes([])
+      transformer.getLayer()?.batchDraw()
+    }
+  },
+)
+
+/** 离开选择工具时卸下 Transformer，避免倾斜时仍挂着多节点导致误联动 */
+watch(
+  () => store.currentTool,
+  async (tool) => {
+    if (props.offscreen) return
+    if (tool === 'SELECT') {
+      if (store.selectedElementId || store.selectedElementIds.length > 0) {
+        await refreshElementTransformer(store.selectedElementId)
+      }
+      return
+    }
     await nextTick()
     const transformer = transformerRef.value?.getNode()
     if (!transformer) return
     transformer.nodes([])
     transformer.getLayer()?.batchDraw()
-  }
-})
+  },
+)
 
 watch(() => store.currentTool, async (tool) => {
   if (props.offscreen) return
@@ -1189,7 +1484,7 @@ watch(() => store.currentTool, async (tool) => {
     if (!transformer) return
     transformer.nodes([])
     transformer.getLayer()?.batchDraw()
-  } else if (store.selectedElementId) {
+  } else if (store.selectedElementId || store.selectedElementIds.length > 0) {
     await refreshElementTransformer(store.selectedElementId)
   }
 })
@@ -1199,7 +1494,8 @@ watch(() => store.currentTool, async (tool) => {
 // ─────────────────────────────────────────────
 /** 本页是否拥有当前选中的 PATH（连续视图下勿在其它页画幽灵锚点） */
 const pathEditElement = computed(() => {
-  if (props.offscreen || !store.isDirectSelectTool || !store.selectedElementId) return null
+  if (props.offscreen || !store.selectedElementId) return null
+  if (!store.isDirectSelectTool && !store.isSkewTool && !store.isFreeDistortTool) return null
   const el = props.page.elements.find(e => e.id === store.selectedElementId && !e.isDeleted)
   if (!el || el.type !== 'PATH' || !el.pathData) return null
   return el
@@ -1215,6 +1511,20 @@ let anchorMarqueeActive = false
 /** 拖动开始时各选中锚点的局部坐标 */
 let anchorDragStarts: Record<number, { x: number; y: number }> = {}
 
+/** 倾斜手势 */
+const skewDragging = ref(false)
+let skewSession: {
+  pathData: string
+  x: number
+  y: number
+  pivot: { x: number; y: number }
+  startPage: { x: number; y: number }
+  refW: number
+  refH: number
+} | null = null
+let skewRaf = 0
+let skewPending: { shx: number; shy: number } | null = null
+
 const pathEditAnchors = computed(() => {
   const el = pathEditElement.value
   if (!el?.pathData) return []
@@ -1223,11 +1533,14 @@ const pathEditAnchors = computed(() => {
 
 function buildPathEditAnchorConfigs() {
   const el = pathEditElement.value
-  if (!el) return [] as { id: string; index: number; config: Record<string, unknown> }[]
+  if (!el || store.isFreeDistortTool) return [] as { id: string; index: number; config: Record<string, unknown> }[]
   const ox = el.pathLocalCoords ? el.x : 0
   const oy = el.pathLocalCoords ? el.y : 0
   const selected = new Set(store.selectedAnchorIndices)
+  const pivot = store.skewPivotAnchorIndex
+  const skewMode = store.isSkewTool
   return pathEditAnchors.value.map((a) => {
+    const isPivot = skewMode && pivot === a.index
     const on = selected.has(a.index)
     const x = ox + a.point.x
     const y = oy + a.point.y
@@ -1235,20 +1548,87 @@ function buildPathEditAnchorConfigs() {
       id: `${el.id}-${a.index}`,
       index: a.index,
       config: {
-        id: `path-anchor-${a.index}`,
-        name: `path-anchor-${a.index}`,
+        id: `path-anchor-${el.id}-${a.index}`,
+        name: `path-anchor-${el.id}-${a.index}`,
         x: s(x),
         y: s(y),
-        radius: on ? 5 : 4,
-        fill: on ? '#1a73e8' : '#ffffff',
-        stroke: '#1a73e8',
-        strokeWidth: 1.5,
-        hitStrokeWidth: 12,
-        draggable: true,
+        radius: isPivot ? 6 : (on ? 5 : 4),
+        fill: isPivot ? '#e8710a' : (on ? '#1a73e8' : '#ffffff'),
+        stroke: isPivot ? '#c45f08' : '#1a73e8',
+        strokeWidth: isPivot ? 2 : 1.5,
+        hitStrokeWidth: 14,
+        draggable: !skewMode,
         listening: true,
       },
     }
   })
+}
+
+const skewPivotCrossConfigs = computed(() => {
+  if (!store.isSkewTool || store.skewPivotAnchorIndex == null || !pathEditElement.value) return []
+  const el = pathEditElement.value
+  const a = pathEditAnchors.value.find((x) => x.index === store.skewPivotAnchorIndex)
+  if (!a) return []
+  const ox = el.pathLocalCoords ? el.x : 0
+  const oy = el.pathLocalCoords ? el.y : 0
+  const cx = s(ox + a.point.x)
+  const cy = s(oy + a.point.y)
+  const arm = 10
+  return [
+    {
+      points: [cx - arm, cy, cx + arm, cy],
+      stroke: '#e8710a',
+      strokeWidth: 1.5,
+      listening: false,
+    },
+    {
+      points: [cx, cy - arm, cx, cy + arm],
+      stroke: '#e8710a',
+      strokeWidth: 1.5,
+      listening: false,
+    },
+  ]
+})
+
+/** 自由变形四角（基于 snapshot 原点显示） */
+const freeDistortCornerConfigs = computed(() => {
+  if (!store.isFreeDistortTool || !store.freeDistortCorners || !store.freeDistortSnapshot) return []
+  const snap = store.freeDistortSnapshot
+  const labels = ['TL', 'TR', 'BR', 'BL']
+  return store.freeDistortCorners.map((c, index) => ({
+    index: index as 0 | 1 | 2 | 3,
+    label: labels[index],
+    config: {
+      id: `free-distort-${index}`,
+      name: `free-distort-${index}`,
+      x: s(snap.x + c.x),
+      y: s(snap.y + c.y),
+      radius: 6,
+      fill: '#7c3aed',
+      stroke: '#5b21b6',
+      strokeWidth: 2,
+      hitStrokeWidth: 16,
+      draggable: true,
+      listening: true,
+    },
+  }))
+})
+
+function onFreeDistortCornerDragMove(e: any, index: 0 | 1 | 2 | 3) {
+  const snap = store.freeDistortSnapshot
+  const corners = store.freeDistortCorners
+  if (!snap || !corners) return
+  const node = e.target
+  const lx = px2mm(node.x()) - snap.x
+  const ly = px2mm(node.y()) - snap.y
+  const next = corners.map((c) => ({ ...c })) as import('@/utils/pathDeform').FreeDistortCorners
+  next[index] = { x: lx, y: ly }
+  store.previewFreeDistortFromCorners(next)
+}
+
+function onFreeDistortCornerDragEnd(e: any, index: 0 | 1 | 2 | 3) {
+  onFreeDistortCornerDragMove(e, index)
+  store.commitFreeDistort()
 }
 
 /** 拖动中不更新，防止 Vue 把节点坐标刷回起点 */
@@ -1272,6 +1652,11 @@ function visiblePathHandles() {
 
 function rebuildPathHandleOverlay() {
   if (handleDragging.value) return
+  if (store.isSkewTool) {
+    pathHandleConfigs.value = []
+    pathHandleSpokeConfigs.value = []
+    return
+  }
   const el = pathEditElement.value
   if (!el) {
     pathHandleConfigs.value = []
@@ -1321,6 +1706,8 @@ watch(
       pathEditElement,
       pathEditAnchors,
       () => store.selectedAnchorIndices.slice(),
+      () => store.skewPivotAnchorIndex,
+      () => store.currentTool,
       () => renderScale.value,
       () => store.scale,
     ],
@@ -1422,6 +1809,7 @@ function handleAnchorDblClick(e: any, index: number) {
 
 /** 不可见宽线段，便于双击插入中点 */
 const pathEditSegmentHits = computed(() => {
+  if (store.isSkewTool || store.isFreeDistortTool) return [] as Record<string, unknown>[]
   const el = pathEditElement.value
   if (!el?.pathData) return [] as Record<string, unknown>[]
   const model = parsePathModel(el.pathData)
@@ -1471,6 +1859,131 @@ function handleAnchorClick(e: any, index: number) {
   store.togglePathAnchor(index, additive)
 }
 
+function onPathAnchorClick(e: any, index: number) {
+  if (store.isSkewTool) {
+    e.cancelBubble = true
+    if (suppressClick.value) return
+    store.setSkewPivotAnchor(index)
+    ElMessage.info({ message: '已选定倾斜中心，拖拽画布进行倾斜（Shift=水平）', duration: 1600, showClose: false })
+    return
+  }
+  handleAnchorClick(e, index)
+}
+
+function onPathAnchorMouseDown(e: any, index: number) {
+  if (store.isSkewTool) {
+    e.cancelBubble = true
+    store.setSkewPivotAnchor(index)
+    return
+  }
+  handleAnchorMouseDown(e, index)
+}
+
+function beginSkewDrag(pagePos: { x: number; y: number }) {
+  const el = pathEditElement.value
+  if (!el?.pathData || store.skewPivotAnchorIndex == null) return false
+  store.ensureSelectedPathNormalized()
+  const el2 = pathEditElement.value
+  if (!el2?.pathData) return false
+  const anchors = extractAnchors(parsePathModel(el2.pathData))
+  const pivotA = anchors.find((a) => a.index === store.skewPivotAnchorIndex)
+  if (!pivotA) return false
+  const boundsW = Math.max(el2.width ?? 1, 1)
+  const boundsH = Math.max(el2.height ?? 1, 1)
+  skewSession = {
+    pathData: el2.pathData,
+    x: el2.x,
+    y: el2.y,
+    pivot: { x: pivotA.point.x, y: pivotA.point.y },
+    startPage: { x: pagePos.x, y: pagePos.y },
+    refW: boundsW,
+    refH: boundsH,
+  }
+  skewDragging.value = true
+  skewPending = null
+  return true
+}
+
+function scheduleSkewPreview(shx: number, shy: number) {
+  if (!skewSession) return
+  skewPending = { shx, shy }
+  if (skewRaf) return
+  skewRaf = requestAnimationFrame(() => {
+    skewRaf = 0
+    const pending = skewPending
+    const session = skewSession
+    if (!pending || !session) return
+    store.applySkewToSelectedPath(
+        { pathData: session.pathData, x: session.x, y: session.y },
+        session.pivot,
+        pending.shx,
+        pending.shy,
+        { skipHistory: true },
+    )
+  })
+}
+
+function onSkewWindowMove(ev: MouseEvent) {
+  if (!skewSession || !skewDragging.value) return
+  const pos = clientToPageMm(ev.clientX, ev.clientY)
+  if (!pos) return
+  const dx = pos.x - skewSession.startPage.x
+  const dy = pos.y - skewSession.startPage.y
+  let shx = dx / skewSession.refH
+  let shy = dy / skewSession.refW
+  // 限幅避免拖飞
+  const lim = 2.5
+  shx = Math.max(-lim, Math.min(lim, shx))
+  shy = Math.max(-lim, Math.min(lim, shy))
+  if (ev.shiftKey) shy = 0
+  if (ev.altKey) shx = 0
+  scheduleSkewPreview(shx, shy)
+}
+
+function onSkewWindowUp(ev: MouseEvent) {
+  window.removeEventListener('mousemove', onSkewWindowMove)
+  window.removeEventListener('mouseup', onSkewWindowUp)
+  if (skewRaf) {
+    cancelAnimationFrame(skewRaf)
+    skewRaf = 0
+  }
+  const session = skewSession
+  const pending = skewPending
+  skewDragging.value = false
+  skewSession = null
+  skewPending = null
+  if (!session) return
+  let shx = 0
+  let shy = 0
+  if (pending) {
+    shx = pending.shx
+    shy = pending.shy
+  } else {
+    const pos = clientToPageMm(ev.clientX, ev.clientY)
+    if (pos) {
+      shx = (pos.x - session.startPage.x) / session.refH
+      shy = (pos.y - session.startPage.y) / session.refW
+      if (ev.shiftKey) shy = 0
+      if (ev.altKey) shx = 0
+    }
+  }
+  if (Math.abs(shx) > 1e-6 || Math.abs(shy) > 1e-6) {
+    store.applySkewToSelectedPath(
+        { pathData: session.pathData, x: session.x, y: session.y },
+        session.pivot,
+        shx,
+        shy,
+    )
+    suppressClick.value = true
+  }
+  pathEditAnchorConfigs.value = buildPathEditAnchorConfigs()
+}
+
+/** 将屏幕坐标转到当前页 mm（与 getStagePos 一致，含视图旋转） */
+function clientToPageMm(clientX: number, clientY: number): { x: number; y: number } | null {
+  return getStagePosFromClient({ clientX, clientY })
+}
+
 function handleAnchorMouseDown(e: any, index: number) {
   e.cancelBubble = true
   const additive = !!(e.evt?.shiftKey || e.evt?.ctrlKey || e.evt?.metaKey)
@@ -1508,7 +2021,7 @@ function handleAnchorDragMove(e: any, index: number) {
     if (i === index) continue
     const s0 = anchorDragStarts[i]
     if (!s0) continue
-    const node = stage.findOne(`#path-anchor-${i}`)
+    const node = stage.findOne(`#path-anchor-${el.id}-${i}`)
     if (node) {
       node.position({ x: s(ox + s0.x + dx), y: s(oy + s0.y + dy) })
     }
@@ -1665,6 +2178,8 @@ const drawingPoints = ref<number[]>([])
 const polylineActive = ref(false)
 const polylinePoints = ref<{ x: number; y: number }[]>([])
 const polylineCursor = ref<{ x: number; y: number } | null>(null)
+/** 每次开始折线/多边形绘制递增，强制预览节点 remount */
+const polylineSessionKey = ref(0)
 
 const previewLayerConfig = computed(() => ({
   listening: false,
@@ -1678,6 +2193,8 @@ const previewLayerConfig = computed(() => ({
 /** 半圆弧：Alt 反转；吸附上一弧端点时默认反向以拼圆 */
 const arcAltFlip = ref(false)
 const arcSnapStart = ref<'a' | 'b' | null>(null)
+/** 正多边形拖拽时 Shift 吸附旋转 */
+const regularPolyShiftSnap = ref(false)
 
 function scalePathMmToPx(d: string): string {
   return d.replace(/[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g, (num) => String(s(Number(num))))
@@ -1814,18 +2331,56 @@ const previewPolylineConfig = computed(() => {
   const flat: number[] = []
   for (const p of pts) flat.push(s(p.x), s(p.y))
   const cur = polylineCursor.value
-  if (cur) flat.push(s(cur.x), s(cur.y))
+  const isPolygon = store.currentTool === 'VECTOR_POLYGON'
+  if (cur) {
+    flat.push(s(cur.x), s(cur.y))
+    // 多边形：橡皮筋闭合回起点，便于看到最终轮廓
+    if (isPolygon && pts.length >= 1) {
+      flat.push(s(pts[0].x), s(pts[0].y))
+    }
+  } else if (isPolygon && pts.length >= 3) {
+    flat.push(s(pts[0].x), s(pts[0].y))
+  }
   const sc = MM_TO_PX * renderScale.value
-  const closed = drawTool.value === 'VECTOR_POLYGON' && pts.length >= 3 && !cur
-  if (closed) flat.push(s(pts[0].x), s(pts[0].y))
   return {
     points:      flat,
     stroke:      store.vectorStrokeColor,
     strokeWidth: store.vectorLineWidth,
     lineCap:     normalizeLineCap(store.vectorLineCap),
     lineJoin:    normalizeLineJoin(store.vectorLineJoin),
-    dash:        dashPatternToKonva(store.vectorDashPattern, sc),
+    dash:        dashPatternToKonva(store.vectorDashPattern, sc) ?? [4, 3],
     closed:      false,
+    listening:   false,
+  }
+})
+
+const previewRegularPolygonConfig = computed(() => {
+  const cx = drawStartX.value
+  const cy = drawStartY.value
+  const dx = drawCurX.value - cx
+  const dy = drawCurY.value - cy
+  const radius = Math.hypot(dx, dy)
+  if (radius < 0.3) return { points: [] as number[], listening: false }
+  let rot = Math.atan2(dy, dx)
+  // Shift：按 15° 吸附旋转
+  // （拖拽过程中 window 事件会带 shiftKey，这里用最近一次写入的标志）
+  if (regularPolyShiftSnap.value) {
+    const step = Math.PI / 12
+    rot = Math.round(rot / step) * step
+  }
+  const verts = regularPolygonVertices(cx, cy, radius, store.regularPolygonSides, rot)
+  const flat: number[] = []
+  for (const p of verts) flat.push(s(p.x), s(p.y))
+  const sc = MM_TO_PX * renderScale.value
+  return {
+    points:      flat,
+    stroke:      store.vectorStrokeColor,
+    strokeWidth: store.vectorLineWidth,
+    lineCap:     normalizeLineCap(store.vectorLineCap),
+    lineJoin:    normalizeLineJoin(store.vectorLineJoin),
+    dash:        dashPatternToKonva(store.vectorDashPattern, sc) ?? [4, 3],
+    fill:        store.vectorFillEnabled ? store.vectorFillColor : undefined,
+    closed:      true,
     listening:   false,
   }
 })
@@ -2286,6 +2841,27 @@ function handleMouseDown(e: any) {
     return
   }
 
+  // 倾斜：已选中心后，在画布上拖拽绕中心剪切（Shift=水平，Alt=垂直）
+  if (store.isSkewTool && e.evt?.button === 0) {
+    const name = typeof e.target?.name === 'function' ? e.target.name() : ''
+    const isAnchor = typeof name === 'string' && name.startsWith('path-anchor-')
+    if (!isAnchor) {
+      if (store.skewPivotAnchorIndex == null) {
+        if (pathEditVisible.value) {
+          ElMessage.info({ message: '请先点击一个锚点作为倾斜中心', duration: 1500, showClose: false })
+        }
+      } else {
+        const pos = getStagePos()
+        if (pos && beginSkewDrag(pos)) {
+          e.evt.preventDefault()
+          window.addEventListener('mousemove', onSkewWindowMove)
+          window.addEventListener('mouseup', onSkewWindowUp)
+          return
+        }
+      }
+    }
+  }
+
   // 直接选择：仅在空白处拖出橡皮筋（点 PATH / 其它元素不抢点击）
   if (store.isDirectSelectTool && pathEditVisible.value) {
     const name = typeof e.target?.name === 'function' ? e.target.name() : ''
@@ -2350,13 +2926,15 @@ function handleMouseDown(e: any) {
     if (!pos) return
     e.evt.preventDefault()
     if (!polylineActive.value) {
+      polylineSessionKey.value += 1
       polylineActive.value = true
       drawTool.value = store.currentTool
       polylinePoints.value = [{ x: pos.x, y: pos.y }]
       polylineCursor.value = { x: pos.x, y: pos.y }
       startPolylineSession()
     } else {
-      polylinePoints.value.push({ x: pos.x, y: pos.y })
+      polylinePoints.value = [...polylinePoints.value, { x: pos.x, y: pos.y }]
+      polylineCursor.value = { x: pos.x, y: pos.y }
     }
     return
   }
@@ -2413,16 +2991,33 @@ function onArcDrawKeyDown(e: KeyboardEvent) {
     e.preventDefault()
     arcAltFlip.value = true
   }
+  if (drawTool.value === 'VECTOR_REGULAR_POLYGON') {
+    if (e.key === 'ArrowUp' || e.key === ']') {
+      e.preventDefault()
+      const n = store.nudgeRegularPolygonSides(1)
+      ElMessage.success({ message: `边数 ${n}`, duration: 600, showClose: false })
+    } else if (e.key === 'ArrowDown' || e.key === '[') {
+      e.preventDefault()
+      const n = store.nudgeRegularPolygonSides(-1)
+      ElMessage.success({ message: `边数 ${n}`, duration: 600, showClose: false })
+    } else if (e.key === 'Shift') {
+      regularPolyShiftSnap.value = true
+    }
+  }
 }
 
 function onArcDrawKeyUp(e: KeyboardEvent) {
   if (e.key === 'Alt') {
     arcAltFlip.value = false
   }
+  if (e.key === 'Shift') {
+    regularPolyShiftSnap.value = false
+  }
 }
 
 function onWindowDrawMouseMove(e: MouseEvent) {
   if (!isDrawing.value) return
+  regularPolyShiftSnap.value = e.shiftKey
   const pos = getStagePosFromClient(e) ?? getStagePos()
   if (!pos) return
   drawCurX.value = pos.x
@@ -2491,7 +3086,7 @@ async function finishDraw() {
 
   try {
     if (tool === 'FREEHAND' && drawingPoints.value.length < 6) return
-    if (['VECTOR_LINE', 'VECTOR_RECT', 'VECTOR_ELLIPSE', 'VECTOR_CIRCLE', 'VECTOR_ARC'].includes(tool)) {
+    if (['VECTOR_LINE', 'VECTOR_RECT', 'VECTOR_ELLIPSE', 'VECTOR_CIRCLE', 'VECTOR_ARC', 'VECTOR_REGULAR_POLYGON'].includes(tool)) {
       if (tool === 'VECTOR_LINE') {
         if (Math.hypot(endX - drawStartX.value, endY - drawStartY.value) < 1) return
       } else if (tool === 'VECTOR_ARC') {
@@ -2501,6 +3096,30 @@ async function finishDraw() {
         store.addVectorArc(props.pageIndex, x1, y1, x2, y2, sign)
         arcSnapStart.value = null
         arcAltFlip.value = false
+        return
+      } else if (tool === 'VECTOR_REGULAR_POLYGON') {
+        const cx = drawStartX.value
+        const cy = drawStartY.value
+        const dx = endX - cx
+        const dy = endY - cy
+        const radius = Math.hypot(dx, dy)
+        if (radius < 0.5) return
+        let rot = Math.atan2(dy, dx)
+        if (regularPolyShiftSnap.value) {
+          const step = Math.PI / 12
+          rot = Math.round(rot / step) * step
+        }
+        await waitForKonvaSettle()
+        store.addVectorRegularPolygon(
+            props.pageIndex,
+            cx,
+            cy,
+            radius,
+            store.regularPolygonSides,
+            rot,
+        )
+        regularPolyShiftSnap.value = false
+        store.selectElement(null)
         return
       } else if (isDrawTooSmall(tool, width, height)) {
         return
@@ -2601,6 +3220,14 @@ function handleStageDblClick(e: any) {
       }
     }
   }
+  // 双击空白：退出编组隔离
+  const name = typeof e.target?.name === 'function' ? e.target.name() : ''
+  const isBackground = e.target === e.target.getStage() || name === 'page-bg'
+  if (isBackground && store.isolationGroupId) {
+    store.exitGroupIsolation()
+    ElMessage.info({ message: '已退出编组编辑', duration: 1200, showClose: false })
+    return
+  }
   if (store.isPenTool && penActive.value) {
     e.evt?.preventDefault?.()
     // 双击会多落一个点，去掉末点后结束
@@ -2651,6 +3278,17 @@ function handleStageClick(e: any) {
     if (isBackground) {
       if (store.selectedAnchorIndices.length > 0) {
         store.clearPathAnchorSelection()
+      } else {
+        store.selectElement(null)
+      }
+    }
+    return
+  }
+
+  if (store.isSkewTool) {
+    if (isBackground) {
+      if (store.skewPivotAnchorIndex != null) {
+        store.setSkewPivotAnchor(null)
       } else {
         store.selectElement(null)
       }
@@ -2740,16 +3378,46 @@ function loadImageDimensions(src: string): Promise<{ width: number; height: numb
 
 function handleElementClick(e: any, elementId: string) {
   if (suppressClick.value) return
-  if (!store.isSelectTool && !store.isDirectSelectTool) return
+  if (!store.isSelectTool && !store.isDirectSelectTool && !store.isSkewTool) return
   ensureActivePageForInteraction()
   const el = props.page.elements.find(item => item.id === elementId)
   if (el?.type === 'SEAL') return
   e.cancelBubble = true
-  if (store.isDirectSelectTool && el?.type !== 'PATH') {
-    ElMessage.info({ message: '直接选择仅用于 PATH 锚点编辑', duration: 1500, showClose: false })
+  if ((store.isDirectSelectTool || store.isSkewTool) && el?.type !== 'PATH') {
+    ElMessage.info({
+      message: store.isSkewTool ? '倾斜工具仅用于 PATH' : '直接选择仅用于 PATH 锚点编辑',
+      duration: 1500,
+      showClose: false,
+    })
     return
   }
-  store.selectElement(elementId)
+  const additive = !!(e.evt?.shiftKey || e.evt?.ctrlKey || e.evt?.metaKey)
+  store.selectElement(elementId, {
+    additive: additive && store.isSelectTool,
+    asLeaf: store.isDirectSelectTool || store.isSkewTool,
+  })
+  if (store.isSkewTool) {
+    store.setSkewPivotAnchor(null)
+  }
+}
+
+function handleElementDblClick(e: any, elementId: string) {
+  if (suppressClick.value) return
+  if (!store.isSelectTool && !store.isDirectSelectTool) return
+  ensureActivePageForInteraction()
+  const el = props.page.elements.find(item => item.id === elementId)
+  if (!el || el.type === 'SEAL') return
+  e.cancelBubble = true
+  // 双击组内成员 → 进入隔离并选中该子对象
+  if (el.groupId) {
+    if (store.enterGroupIsolation(elementId)) {
+      if (store.isSelectTool && el.type === 'PATH') {
+        // 隔离后仍用选择工具移动单个子对象；锚点编辑需切直接选择
+      }
+      ElMessage.info({ message: '已进入编组编辑（Esc 退出）', duration: 1400, showClose: false })
+    }
+    return
+  }
 }
 
 function handleAnnotationClick(e: any, id: string) {
@@ -2996,16 +3664,205 @@ async function commitAnnotation(
 // ─────────────────────────────────────────────
 // OFD 元素拖拽 / 变换
 // ─────────────────────────────────────────────
+/**
+ * 整组 / 多选拖拽：
+ * - mousedown 先整组选中（避免 drag 早于 click 导致单成员拖走）
+ * - 用 groupDragOffset 驱动 config 坐标，避免 Vue 把兄弟刷回旧位置造成相对错位
+ */
+const groupDragOffset = ref<{
+  leaderId: string
+  dpx: number
+  dpy: number
+  starts: Record<string, {
+    nodeX: number
+    nodeY: number
+    elX: number
+    elY: number
+    pathLocal: boolean
+    pathData?: string
+    type: string
+  }>
+} | null>(null)
+
+function elementBaseNodePos(el: ElementData): { x: number; y: number } {
+  if (el.type === 'PATH' && el.pathLocalCoords !== true) return { x: 0, y: 0 }
+  return { x: s(el.x), y: s(el.y) }
+}
+
+/** config 用：拖组过程中返回视觉坐标 */
+function resolveDragPos(elementId: string, baseX: number, baseY: number): { x: number; y: number } {
+  const off = groupDragOffset.value
+  if (!off) return { x: baseX, y: baseY }
+  const st = off.starts[elementId]
+  if (!st) return { x: baseX, y: baseY }
+  return { x: st.nodeX + off.dpx, y: st.nodeY + off.dpy }
+}
+
+/** 选择工具下按下即选组，保证随后的 dragstart 能建整组会话 */
+function handleElementMouseDown(e: any, elementId: string) {
+  if (props.offscreen || !store.isSelectTool) return
+  if (e.evt?.button !== 0) return
+  if (groupDragOffset.value) return
+  const additive = !!(e.evt?.shiftKey || e.evt?.ctrlKey || e.evt?.metaKey)
+  if (additive) return
+  const el = props.page.elements.find((item) => item.id === elementId && !item.isDeleted)
+  if (!el || el.type === 'SEAL') return
+
+  if (el.groupId && store.isolationGroupId !== el.groupId) {
+    store.selectElement(elementId, { preferGroup: true })
+    return
+  }
+
+  if (!store.isElementInSelection(elementId)) {
+    store.selectElement(elementId, { preferGroup: true })
+  }
+}
+
+function beginGroupDragSession(leaderId: string, leaderNode: any): boolean {
+  const stage = stageRef.value?.getNode?.()
+  if (!stage) return false
+
+  const leaderEl = props.page.elements.find((x) => x.id === leaderId && !x.isDeleted)
+  if (
+    leaderEl?.groupId
+    && store.isolationGroupId !== leaderEl.groupId
+    && store.selectedGroupId !== leaderEl.groupId
+  ) {
+    store.selectElement(leaderId, { preferGroup: true })
+  }
+
+  const memberIds = store.selectedGroupId
+    ? store.getGroupMemberIds(store.selectedGroupId)
+    : (store.selectedElementIds.length > 1 ? [...store.selectedElementIds] : [])
+
+  if (memberIds.length < 2 || !memberIds.includes(leaderId)) {
+    groupDragOffset.value = null
+    return false
+  }
+
+  const starts: NonNullable<typeof groupDragOffset.value>['starts'] = {}
+  for (const id of memberIds) {
+    const el = props.page.elements.find((x) => x.id === id && !x.isDeleted)
+    if (!el) continue
+    const base = elementBaseNodePos(el)
+    const node = stage.findOne('#' + id) as any
+    starts[id] = {
+      nodeX: id === leaderId ? leaderNode.x() : (node ? node.x() : base.x),
+      nodeY: id === leaderId ? leaderNode.y() : (node ? node.y() : base.y),
+      elX: el.x,
+      elY: el.y,
+      pathLocal: el.type === 'PATH' ? el.pathLocalCoords === true : true,
+      pathData: el.type === 'PATH' ? el.pathData : undefined,
+      type: el.type,
+    }
+  }
+  if (Object.keys(starts).length < 2) {
+    groupDragOffset.value = null
+    return false
+  }
+
+  const transformer = transformerRef.value?.getNode?.()
+  if (transformer) {
+    transformer.nodes([])
+    transformer.getLayer()?.batchDraw()
+  }
+
+  groupDragOffset.value = {
+    leaderId,
+    dpx: 0,
+    dpy: 0,
+    starts,
+  }
+  return true
+}
+
+function handleDragStart(e: any, elementId: string) {
+  if (!store.isSelectTool) {
+    groupDragOffset.value = null
+    return
+  }
+  const el = props.page.elements.find((x) => x.id === elementId && !x.isDeleted)
+  if (el?.groupId && store.isolationGroupId !== el.groupId) {
+    if (store.selectedGroupId !== el.groupId) {
+      store.selectElement(elementId, { preferGroup: true })
+    }
+  } else if (!store.isElementInSelection(elementId)) {
+    store.selectElement(elementId, { preferGroup: true })
+  }
+
+  beginGroupDragSession(elementId, e.target)
+}
+
+function handleDragMove(e: any, elementId: string) {
+  const off = groupDragOffset.value
+  if (!off || off.leaderId !== elementId) return
+  const st = off.starts[elementId]
+  if (!st) return
+  groupDragOffset.value = {
+    ...off,
+    dpx: e.target.x() - st.nodeX,
+    dpy: e.target.y() - st.nodeY,
+  }
+}
+
 async function handleDragEnd(e: any, elementId: string) {
-  const element = props.page.elements.find(el => el.id === elementId)
   const node = e.target
+  const session = groupDragOffset.value
+  groupDragOffset.value = null
+
+  if (session && session.leaderId === elementId && Object.keys(session.starts).length > 1) {
+    const st = session.starts[elementId]
+    const dpx = st ? node.x() - st.nodeX : session.dpx
+    const dpy = st ? node.y() - st.nodeY : session.dpy
+    const dxMm = px2mm(dpx)
+    const dyMm = px2mm(dpy)
+    if (Math.abs(dxMm) > 1e-6 || Math.abs(dyMm) > 1e-6) {
+      const updates: Array<{ id: string; changes: Partial<ElementData> }> = []
+      for (const [id, m] of Object.entries(session.starts)) {
+        if (m.type === 'PATH' && !m.pathLocal && m.pathData) {
+          updates.push({
+            id,
+            changes: {
+              x: m.elX + dxMm,
+              y: m.elY + dyMm,
+              pathData: translateSvgPath(m.pathData, dxMm, dyMm),
+            },
+          })
+        } else {
+          updates.push({
+            id,
+            changes: { x: m.elX + dxMm, y: m.elY + dyMm },
+          })
+        }
+      }
+      store.updateElementsBatch(props.pageIndex, updates)
+    }
+    const stage = stageRef.value?.getNode?.()
+    if (stage) {
+      for (const [id, m] of Object.entries(session.starts)) {
+        if (m.type === 'PATH' && !m.pathLocal) {
+          const n = stage.findOne('#' + id) as any
+          if (n) {
+            n.x(0)
+            n.y(0)
+          }
+        }
+      }
+    }
+    await refreshElementTransformer(elementId)
+    return
+  }
+
+  const element = props.page.elements.find(el => el.id === elementId)
+  const multi = store.selectedElementIds.length > 1
+  const histOpt = multi ? { skipHistory: true } as const : undefined
 
   if (element?.type === 'PATH' && element.pathData) {
     if (element.pathLocalCoords) {
       store.updateElement(props.pageIndex, elementId, {
         x: px2mm(node.x()),
         y: px2mm(node.y()),
-      })
+      }, histOpt)
     } else {
       const dx = px2mm(node.x())
       const dy = px2mm(node.y())
@@ -3014,7 +3871,7 @@ async function handleDragEnd(e: any, elementId: string) {
           x: element.x + dx,
           y: element.y + dy,
           pathData: translateSvgPath(element.pathData, dx, dy),
-        })
+        }, histOpt)
       }
       node.x(0)
       node.y(0)
@@ -3023,14 +3880,26 @@ async function handleDragEnd(e: any, elementId: string) {
     store.updateElement(props.pageIndex, elementId, {
       x: px2mm(node.x()),
       y: px2mm(node.y()),
-    })
+    }, histOpt)
   }
+  if (multi) scheduleMultiEditHistoryFlush()
   await refreshElementTransformer(elementId)
+}
+
+let multiEditHistoryTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleMultiEditHistoryFlush() {
+  if (multiEditHistoryTimer) clearTimeout(multiEditHistoryTimer)
+  multiEditHistoryTimer = setTimeout(() => {
+    multiEditHistoryTimer = null
+    store.saveToHistory()
+  }, 0)
 }
 
 async function handleTransformEnd(e: any, elementId: string) {
   const node = e.target
   const element = props.page.elements.find(el => el.id === elementId)
+  const multi = store.selectedElementIds.length > 1
+  const histOpt = multi ? { skipHistory: true } as const : undefined
 
   if (element?.type === 'IMAGE') {
     const scaleX = node.scaleX()
@@ -3047,7 +3916,7 @@ async function handleTransformEnd(e: any, elementId: string) {
       scaleX:   1,
       scaleY:   1,
       rotation: node.rotation(),
-    })
+    }, histOpt)
   } else if (element?.type === 'PATH' && element.pathLocalCoords && element.pathData) {
     // getPathConfig 用 scaleX/Y = MM_TO_PX*zoom 把「mm 路径」画到屏幕；
     // Transformer 改的是节点总 scale，必须先除掉显示系数，只把用户缩放写入 path。
@@ -3073,7 +3942,7 @@ async function handleTransformEnd(e: any, elementId: string) {
       scaleX:   1,
       scaleY:   1,
       rotation: node.rotation(),
-    })
+    }, histOpt)
   } else if (element?.type === 'PATH') {
     const dx = px2mm(node.x())
     const dy = px2mm(node.y())
@@ -3088,7 +3957,7 @@ async function handleTransformEnd(e: any, elementId: string) {
       scaleX:   1,
       scaleY:   1,
       rotation: node.rotation(),
-    })
+    }, histOpt)
   } else {
     store.updateElement(props.pageIndex, elementId, {
       x:        px2mm(node.x()),
@@ -3096,8 +3965,9 @@ async function handleTransformEnd(e: any, elementId: string) {
       scaleX:   node.scaleX(),
       scaleY:   node.scaleY(),
       rotation: node.rotation(),
-    })
+    }, histOpt)
   }
+  if (multi) scheduleMultiEditHistoryFlush()
   await refreshElementTransformer(elementId)
 }
 
@@ -3168,16 +4038,18 @@ function textCtmScaleX(element: ElementData): number {
 }
 
 function getGlyphRunGroupConfig(element: ElementData) {
-  const isSelected = store.selectedElementId === element.id
+  const isSelected = store.isElementInSelection(element.id)
+  const pos = resolveDragPos(element.id, s(element.x), s(element.y))
   return {
     id:        element.id,
-    x:         s(element.x),
-    y:         s(element.y),
+    x:         pos.x,
+    y:         pos.y,
     scaleX:    textCtmScaleX(element),
     scaleY:    1,
     rotation:  element.rotation ?? 0,
-    draggable: elementDraggable(),
-    listening: elementListens(),
+    opacity:   elementOpacity(element),
+    draggable: elementDraggable(element),
+    listening: elementListens(element),
     stroke:    isSelected ? '#1a73e8' : undefined,
     strokeWidth: isSelected ? 0.5 : 0,
   }
@@ -3257,16 +4129,18 @@ function resolveTextFontPx(element: ElementData): number {
 }
 
 function getCurrencyGroupConfig(element: ElementData) {
-  const isSelected = store.selectedElementId === element.id
+  const isSelected = store.isElementInSelection(element.id)
+  const pos = resolveDragPos(element.id, s(element.x), s(element.y))
   return {
     id:        element.id,
-    x:         s(element.x),
-    y:         s(element.y),
+    x:         pos.x,
+    y:         pos.y,
     scaleX:    textCtmScaleX(element),
     scaleY:    1,
     rotation:  element.rotation ?? 0,
-    draggable: elementDraggable(),
-    listening: elementListens(),
+    opacity:   elementOpacity(element),
+    draggable: elementDraggable(element),
+    listening: elementListens(element),
     stroke:    isSelected ? '#1a73e8' : undefined,
     strokeWidth: isSelected ? 0.5 : 0,
   }
@@ -3275,7 +4149,7 @@ function getCurrencyGroupConfig(element: ElementData) {
 function getCurrencyHeadConfig(element: ElementData) {
   const parts = getCurrencySplitParts(element.content ?? '')
   const fsPx  = resolveTextFontPx(element)
-  const isSelected = store.selectedElementId === element.id
+  const isSelected = store.isElementInSelection(element.id)
   const headText = parts ? parts.prefix + parts.symbol : ''
   return {
     id:    `${element.id}-cur-h`,
@@ -3295,7 +4169,7 @@ function getCurrencyTailConfig(element: ElementData) {
   const parts = getCurrencySplitParts(element.content ?? '')
   const fsMm  = element.fontSize ?? 3
   const fsPx  = resolveTextFontPx(element)
-  const isSelected = store.selectedElementId === element.id
+  const isSelected = store.isElementInSelection(element.id)
   return {
     id:    `${element.id}-cur-t`,
     x:     parts ? currencyTailOffsetPx(parts.prefix, fsMm, element.glyphAdvanceMm) : 0,
@@ -3311,7 +4185,7 @@ function getCurrencyTailConfig(element: ElementData) {
 }
 
 function getTextConfig(element: ElementData) {
-  const isSelected = store.selectedElementId === element.id
+  const isSelected = store.isElementInSelection(element.id)
   const content    = element.content ?? ''
   const hasNl      = content.includes('\n')
   const fsMm       = element.fontSize ?? 3
@@ -3375,15 +4249,17 @@ function getTextConfig(element: ElementData) {
     lineHeight = Math.min(1.12, Math.max(0.92, (hMm * 0.96) / (lineCount * fsMm)))
   }
 
+  const dragPos = resolveDragPos(element.id, s(element.x), s(element.y))
   const baseCfg = {
     id:             element.id,
-    x:              s(element.x),
-    y:              s(element.y),
+    x:              dragPos.x,
+    y:              dragPos.y,
     scaleX:         textCtmScaleX(element),
     scaleY:         1,
     rotation:       element.rotation ?? 0,
-    draggable:      elementDraggable(),
-    listening:      elementListens(),
+    opacity:        elementOpacity(element),
+    draggable:      elementDraggable(element),
+    listening:      elementListens(element),
     text:           displayText,
     fontSize:       fsPx,
     letterSpacing,
@@ -3410,7 +4286,7 @@ function getTextConfig(element: ElementData) {
 
 function getPathConfig(element: ElementData) {
   const e          = element as any
-  const isSelected = store.selectedElementId === element.id
+  const isSelected = store.isElementInSelection(element.id)
   const sc         = MM_TO_PX * renderScale.value
   const local      = e.pathLocalCoords === true
   // OFD 矢量：纯填充/纯描边由 path*Enabled 与线宽控制；无描边时不得强制灰色描边
@@ -3419,24 +4295,25 @@ function getPathConfig(element: ElementData) {
   const lw         = (typeof e.lineWidth === 'number' && e.lineWidth > 0) ? e.lineWidth : 0
   const hasStrokeColor = isNotEmptyStr(e.strokeColor)
   const canStroke  = !strokeOff && (lw > 0 || hasStrokeColor)
-  const strokeW    = isSelected
-      ? 2 / sc
-      : (strokeOff ? 0 : (lw > 0 ? lw : (hasStrokeColor ? 0.3 : 0)))
-  const strokeCol  = isSelected
-      ? '#1a73e8'
-      : (strokeOff || (strokeW <= 0 && !isSelected) ? undefined : (e.strokeColor || '#222222'))
+  // 选中时保留真实描边颜色/线宽/虚线，便于像 Illustrator 一样即时调样式（选择框由 Transformer 负责）
+  const strokeW    = strokeOff ? 0 : (lw > 0 ? lw : (hasStrokeColor ? 0.3 : 0))
+  const strokeCol  = strokeOff || strokeW <= 0 ? undefined : (e.strokeColor || '#222222')
   const dash = dashPatternToKonva(e.dashPattern, sc)
   // strokeScaleEnabled:false 时 stroke/hit 线宽按「屏幕像素」计。
   // 只加大命中区，不改视觉线宽、不改 strokeScaleEnabled（避免保存后观感/坐标系异常）。
   const hitStrokePx = Math.max(16, (strokeW > 0 ? strokeW : 0) * sc)
+  const baseX = local ? s(element.x) : 0
+  const baseY = local ? s(element.y) : 0
+  const pos = resolveDragPos(element.id, baseX, baseY)
   return {
     id:                 element.id,
-    x:                  local ? s(element.x) : 0,
-    y:                  local ? s(element.y) : 0,
+    x:                  pos.x,
+    y:                  pos.y,
     scaleX:             sc, scaleY: sc,
     rotation:           element.rotation ?? 0,
-    draggable:          elementDraggable(),
-    listening:          elementListens(),
+    opacity:            elementOpacity(element),
+    draggable:          elementDraggable(element),
+    listening:          elementListens(element),
     data:               getPathData(element),
     fill:               fillOff ? 'transparent' : (e.fillColor ?? 'transparent'),
     stroke:             strokeCol,
@@ -3477,21 +4354,23 @@ function getSealPlaceholderConfig(element: ElementData) {
 }
 
 function getImageConfig(element: ElementData) {
-  const isSelected = store.selectedElementId === element.id
+  const isSelected = store.isElementInSelection(element.id)
+  const pos = resolveDragPos(element.id, s(element.x), s(element.y))
   return {
     id:          element.id,
-    x:           s(element.x),
-    y:           s(element.y),
+    x:           pos.x,
+    y:           pos.y,
     width:       s(element.width),
     height:      s(element.height),
     rotation:    element.rotation ?? 0,
     scaleX:      element.scaleX ?? 1,
     scaleY:      element.scaleY ?? 1,
-    draggable:   elementDraggable(),
-    listening:   elementListens(),
+    draggable:   elementDraggable(element),
+    listening:   elementListens(element),
     image:       imageMap[element.id],
     stroke:      isSelected ? '#1a73e8' : undefined,
     strokeWidth: isSelected ? 1 : 0,
+    opacity:     elementOpacity(element),
   }
 }
 
@@ -3500,7 +4379,7 @@ function getImagePlaceholderConfig(element: ElementData) {
     id: element.id, x: s(element.x), y: s(element.y),
     width: s(element.width), height: s(element.height),
     fill: 'rgba(120,120,120,0.08)', stroke: 'rgba(120,120,120,0.35)',
-    strokeWidth: 1, draggable: elementDraggable(), listening: elementListens(), listening: elementListens(),
+    strokeWidth: 1, draggable: elementDraggable(element), listening: elementListens(element),
   }
 }
 
@@ -3509,7 +4388,7 @@ function getImageFailedConfig(element: ElementData) {
     id: element.id, x: s(element.x), y: s(element.y),
     width: s(element.width), height: s(element.height),
     fill: 'rgba(255,77,79,0.12)', stroke: '#ff4d4f',
-    strokeWidth: 1, draggable: elementDraggable(), listening: elementListens(),
+    strokeWidth: 1, draggable: elementDraggable(element), listening: elementListens(element),
   }
 }
 
@@ -3518,33 +4397,44 @@ function getImageNoSrcPlaceholderConfig(element: ElementData) {
     id: element.id, x: s(element.x), y: s(element.y),
     width: s(element.width), height: s(element.height),
     fill: 'rgba(255,0,0,0.05)', stroke: '#ffaaaa',
-    strokeWidth: 1, draggable: elementDraggable(), listening: elementListens(),
+    strokeWidth: 1, draggable: elementDraggable(element), listening: elementListens(element),
   }
 }
 
 function getFallbackConfig(element: ElementData) {
-  const isSelected = store.selectedElementId === element.id
+  const isSelected = store.isElementInSelection(element.id)
   return {
     id: element.id, x: s(element.x), y: s(element.y),
     width: s(element.width), height: s(element.height),
     fill: 'transparent',
     stroke: isSelected ? '#1a73e8' : 'transparent',
     strokeWidth: isSelected ? 1 : 0,
-    draggable: elementDraggable(),
-    listening: elementListens(),
+    draggable: elementDraggable(element),
+    listening: elementListens(element),
   }
 }
 
 // ─────────────────────────────────────────────
 // 注释 Config
 // ─────────────────────────────────────────────
-function elementDraggable() { return store.isSelectTool && !props.offscreen }
+function elementDraggable(element?: ElementData) {
+  if (!store.isSelectTool || props.offscreen) return false
+  if (element && store.isolationGroupId && element.groupId !== store.isolationGroupId) return false
+  // 未隔离的组员也可拖：mousedown/dragstart 会先整组选中再联动
+  return true
+}
 
 /** 绘制类工具激活时，正文元素不拦截点击，便于在页内任意位置落点 */
-function elementListens() {
+function elementListens(element?: ElementData) {
   if (props.offscreen) return false
   if (store.isVectorTool || store.isTypewriterTool) return false
+  if (store.isolationGroupId && element && element.groupId !== store.isolationGroupId) return false
   return true
+}
+
+function elementOpacity(element: ElementData): number {
+  if (!store.isolationGroupId) return 1
+  return element.groupId === store.isolationGroupId ? 1 : 0.28
 }
 
 function annDraggable() { return store.currentTool === 'SELECT' && !props.offscreen }
@@ -3880,10 +4770,16 @@ async function captureForPrint(
   const annLayer: any = annotationLayerRef.value?.getNode?.()
   const prevAnnVisible = annLayer?.visible?.() ?? true
   const gridNodes: any[] = stage?.find?.('.reference-grid') ?? []
+  const guideNodes: any[] = stage?.find?.('.guide-line') ?? []
+  const draftNodes: any[] = stage?.find?.('.guide-draft') ?? []
   const prevGridVisible = gridNodes.map((n: any) => n.visible?.() ?? true)
+  const prevGuideVisible = guideNodes.map((n: any) => n.visible?.() ?? true)
+  const prevDraftVisible = draftNodes.map((n: any) => n.visible?.() ?? true)
 
   if (annLayer && !includeAnnotations) annLayer.visible(false)
   for (const n of gridNodes) n.visible?.(false)
+  for (const n of guideNodes) n.visible?.(false)
+  for (const n of draftNodes) n.visible?.(false)
   stage?.draw?.()
 
   let dataUrl = ''
@@ -3898,6 +4794,8 @@ async function captureForPrint(
     annLayer.visible(prevAnnVisible)
   }
   gridNodes.forEach((n: any, i: number) => n.visible?.(prevGridVisible[i]))
+  guideNodes.forEach((n: any, i: number) => n.visible?.(prevGuideVisible[i]))
+  draftNodes.forEach((n: any, i: number) => n.visible?.(prevDraftVisible[i]))
   stage?.draw?.()
 
   const rotation = props.offscreen
@@ -3914,6 +4812,131 @@ defineExpose({ captureForPrint })
 <style scoped>
 .canvas-wrapper {
   position: relative;
+}
+
+.canvas-wrapper--rulers {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  grid-template-rows: 18px 1fr;
+}
+
+.ruler-corner {
+  grid-column: 1;
+  grid-row: 1;
+  background: #e8eaed;
+  border-right: 1px solid #c5c9d0;
+  border-bottom: 1px solid #c5c9d0;
+  z-index: 3;
+}
+
+.ruler {
+  position: relative;
+  background: linear-gradient(180deg, #f3f4f6 0%, #e8eaed 100%);
+  z-index: 3;
+  overflow: hidden;
+  user-select: none;
+}
+
+.ruler-h {
+  grid-column: 2;
+  grid-row: 1;
+  border-bottom: 1px solid #c5c9d0;
+  cursor: row-resize;
+}
+
+.ruler-v {
+  grid-column: 1;
+  grid-row: 2;
+  border-right: 1px solid #c5c9d0;
+  cursor: col-resize;
+}
+
+.ruler-tick {
+  position: absolute;
+  pointer-events: none;
+}
+
+.ruler-h .ruler-tick {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #9aa0a6;
+}
+
+.ruler-h .ruler-tick.major {
+  background: #5f6368;
+}
+
+.ruler-h .ruler-tick::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 6px;
+  background: inherit;
+}
+
+.ruler-h .ruler-tick.major::after {
+  height: 10px;
+}
+
+.ruler-v .ruler-tick {
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: #9aa0a6;
+}
+
+.ruler-v .ruler-tick.major {
+  background: #5f6368;
+}
+
+.ruler-v .ruler-tick::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  height: 1px;
+  width: 6px;
+  background: inherit;
+}
+
+.ruler-v .ruler-tick.major::after {
+  width: 10px;
+}
+
+.ruler-label {
+  position: absolute;
+  font-style: normal;
+  font-size: 9px;
+  line-height: 1;
+  color: #5f6368;
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+.ruler-h .ruler-label {
+  top: 1px;
+  left: 3px;
+}
+
+.ruler-v .ruler-label {
+  top: 2px;
+  left: 1px;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+}
+
+.stage-host {
+  grid-column: 2;
+  grid-row: 2;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+
+.canvas-wrapper:not(.canvas-wrapper--rulers) .stage-host {
+  display: contents;
 }
 
 .text-select-layer {
@@ -3953,6 +4976,10 @@ defineExpose({ captureForPrint })
 
 .canvas-wrapper.cursor-direct {
   cursor: default;
+}
+
+.canvas-wrapper.cursor-skew {
+  cursor: crosshair;
 }
 
 .canvas-wrapper--offscreen {

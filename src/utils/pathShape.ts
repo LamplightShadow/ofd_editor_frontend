@@ -254,6 +254,45 @@ export function buildPolylineShape(points: PointMm[], closed: boolean): PathShap
   }
 }
 
+/**
+ * 正多边形：圆心 + 半径 + 边数。
+ * rotationRad 为第一个顶点相对圆心的方位角（默认 -π/2，顶点朝上）。
+ */
+export function buildRegularPolygonShape(
+  cx: number,
+  cy: number,
+  radius: number,
+  sides: number,
+  rotationRad = -Math.PI / 2,
+): PathShapeResult {
+  const n = Math.max(3, Math.min(24, Math.round(sides)))
+  const r = Math.max(radius, 0.01)
+  const pts: PointMm[] = []
+  for (let i = 0; i < n; i++) {
+    const a = rotationRad + (i * 2 * Math.PI) / n
+    pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) })
+  }
+  return buildPolylineShape(pts, true)
+}
+
+/** 页坐标下正多边形顶点（用于预览） */
+export function regularPolygonVertices(
+  cx: number,
+  cy: number,
+  radius: number,
+  sides: number,
+  rotationRad = -Math.PI / 2,
+): PointMm[] {
+  const n = Math.max(3, Math.min(24, Math.round(sides)))
+  const r = Math.max(radius, 0)
+  const pts: PointMm[] = []
+  for (let i = 0; i < n; i++) {
+    const a = rotationRad + (i * 2 * Math.PI) / n
+    pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) })
+  }
+  return pts
+}
+
 /** 页坐标 SVG path 整体平移（PathModel；保留 C） */
 export function translateSvgPath(pathData: string, dx: number, dy: number): string {
   return translateSvgPathViaModel(pathData, dx, dy)
